@@ -294,6 +294,27 @@ class WorkflowDatabase:
         row = cursor.fetchone()
         return self._row_to_attempt(row) if row else None
 
+    def delete_attempts(self, request_id: int) -> None:
+        """Delete every Attempt (and its phases) for a Request.
+
+        Reconciliation uses this to rebuild a Request's Attempt history from the
+        cluster when the cache and the cluster disagree on Attempt identity, count or
+        order (the cache is disposable; the cluster is the source of truth, ADR-0001).
+        Phases are removed first because the schema's foreign key has no cascade.
+        """
+        assert self.conn is not None
+        cursor = self.conn.cursor()
+        try:
+            cursor.execute(
+                "DELETE FROM attempt_phases WHERE attempt_id IN (SELECT id FROM attempts WHERE request_id = ?)",
+                (request_id,),
+            )
+            cursor.execute("DELETE FROM attempts WHERE request_id = ?", (request_id,))
+            self.conn.commit()
+        except Exception:
+            self.conn.rollback()
+            raise
+
     # -- Attempt phases ----------------------------------------------------
 
     def upsert_phase(
