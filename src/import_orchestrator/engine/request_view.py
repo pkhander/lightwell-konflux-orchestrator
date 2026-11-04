@@ -73,9 +73,17 @@ class RequestView:
             stats[self.state(r).value] += 1
         return stats
 
-    def is_complete(self, max_retries: int) -> bool:
-        """True when no Request is still in flight or retriable."""
+    def is_complete(self, max_retries: int, skip_ids: set[int] | None = None) -> bool:
+        """True when no Request is still in flight or retriable.
+
+        ``skip_ids`` are Requests the reconciler could not read this run; they are
+        neither triggered nor counted toward completion, so one unreadable Request does
+        not hang the loop -- it is deferred to the next invocation.
+        """
+        skip = skip_ids or set()
         for r in self.requests():
+            if r.id in skip:
+                continue
             st = self.state(r)
             if st in (RequestState.PENDING, RequestState.RUNNING, RequestState.AWAITING_RELEASE):
                 return False

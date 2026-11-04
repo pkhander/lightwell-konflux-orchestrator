@@ -265,6 +265,86 @@ class KubeClient:
         running_prs = self.get_running_pipelineruns()
         return sum(1 for pr in running_prs if pr.name.startswith(prefix))
 
+    # Intake PipelineRuns carry type=build. The fingerprint label is also propagated onto
+    # the Snapshot and integration-test PipelineRuns, so scope the query to type=build to
+    # return only intakes.
+    _PIPELINERUN_TYPE_LABEL = "pipelines.appstudio.openshift.io/type"
+
+    def find_intake_pipelineruns_by_fingerprint(self, fingerprint: str) -> list[PipelineRunStatus]:
+        """Find intake PipelineRuns carrying ``fingerprint``, oldest first.
+
+        Reconciliation entry point (ADR-0001): a run finds the PipelineRuns it stamped
+        with the Request fingerprint instead of trusting the cache. Each Attempt stamps
+        the same (per-Request) fingerprint, so several may match; oldest-first lets the
+        caller rebuild one Attempt per PipelineRun. Live and KubeArchive are merged so a
+        history spanning pruned runs is complete. A PipelineRun with no condition yet is
+        reported RUNNING, not dropped, so a fresh intake is never re-triggered.
+
+        Raises :class:`requests.RequestException` if the *live* list fails: the caller
+        must be able to tell "query failed" from "no PipelineRuns match", because
+        treating a transient error as "nothing exists" would let it create a duplicate
+        intake. A KubeArchive outage only loses pruned history and degrades to live-only.
+        """
+        selector = f"{FINGERPRINT_LABEL}={fingerprint},{self._PIPELINERUN_TYPE_LABEL}=build"
+        items = self._list_pipelineruns_by_label(selector)
+        items.sort(key=lambda item: (item.get("metadata", {}) or {}).get("creationTimestamp", ""))
+        statuses = []
+        for item in items:
+            if pr_status := self._pipelinerun_status_from_item(item):
+                statuses.append(pr_status)
+        return statuses
+
+    def _list_pipelineruns_by_label(self, selector: str) -> list[dict]:
+        """List PipelineRuns matching a label selector, merging live and KubeArchive.
+
+        The live list is authoritative for in-flight work and is not error-masked: a
+        failed live query re-raises so the caller can distinguish it from an empty
+        result (treating a transient error as "nothing exists" would let the caller
+        create a duplicate). KubeArchive only supplies pruned history, so its outage
+        degrades to [] and simply merges nothing. Live items first, then
+        KubeArchive-only items (deduplicated by name).
+        """
+        path = f"/apis/tekton.dev/v1/namespaces/{self.namespace}/pipelineruns"
+        items = self._list_by_label(self._api, path, selector, source="cluster", raise_on_error=True)
+        if self._ka_api is not None:
+            archived = self._list_by_label(self._ka_api, path, selector, source="KubeArchive", raise_on_error=False)
+            seen = {(item.get("metadata", {}) or {}).get("name") for item in items}
+            items = items + [i for i in archived if (i.get("metadata", {}) or {}).get("name") not in seen]
+        return items
+
+    def _list_by_label(
+        self, api: KubeAPI, path: str, selector: str, *, source: str, raise_on_error: bool
+    ) -> list[dict]:
+        """GET a label-filtered list from one API.
+
+        The error is always logged. With ``raise_on_error`` it then re-raises (the
+        caller must tell a failed query from an empty one); otherwise it degrades to [].
+        """
+        try:
+            result = api.list(path, labelSelector=selector)
+            return result.get("items", [])
+        except requests.RequestException as e:
+            self._log_api_error(f"list resources by label {selector}", e, source=source, ignore_not_found=True)
+            if raise_on_error:
+                raise
+            return []
+
+    @staticmethod
+    def _pipelinerun_status_from_item(item: dict) -> PipelineRunStatus | None:
+        """Map a PipelineRun list item to a status, or None if unnamed.
+
+        No recognised condition means the run just started: report RUNNING so the caller
+        does not re-trigger it.
+        """
+        name = (item.get("metadata", {}) or {}).get("name", "")
+        if not name:
+            return None
+        cond = KubeClient._succeeded_condition(item)
+        status = cond.get("status", "") if cond else ""
+        if status not in ("True", "False", "Unknown"):
+            status = "Unknown"
+        return PipelineRunStatus(name, status)
+
     def find_snapshot_by_pipelinerun(self, pr_name: str) -> str | None:
         """Find the Snapshot created by a specific PipelineRun via its label."""
         try:
@@ -454,6 +534,62 @@ class KubeClient:
             return None
         except KeyError:
             return None
+
+    def list_releases_for_snapshot_and_plan(
+        self, snapshot_name: str, release_plan: str | None = None
+    ) -> list[tuple[str, Literal["True", "False", "Unknown"]]]:
+        """List every Release for a snapshot (optionally scoped to a ReleasePlan), newest first.
+
+        Unlike :meth:`find_release_for_snapshot_and_plan`, this does *not* filter out
+        terminally-failed Releases: reconciliation needs the complete set so it can
+        count release retries (each terminal Release is one spent Attempt) and record
+        the newest Release's real status. Each entry is ``(name, status)`` where status
+        is the effective ``Released`` condition ("True"/"False"/"Unknown"), newest first
+        by ``creationTimestamp``.
+
+        Raises :class:`requests.RequestException` on a failed list, so the caller can
+        tell "query failed" from "no Releases exist" rather than silently undercounting
+        the retry budget (which would reset ``max_retries`` across a cache wipe).
+        """
+        result = self._api.list(
+            f"/apis/appstudio.redhat.com/v1alpha1/namespaces/{self.namespace}/releases",
+        )
+        matches = []
+        for item in result.get("items", []):
+            spec = item.get("spec", {})
+            if spec.get("snapshot") != snapshot_name:
+                continue
+            if release_plan is not None and spec.get("releasePlan") != release_plan:
+                continue
+            matches.append(item)
+        matches.sort(key=lambda i: i.get("metadata", {}).get("creationTimestamp", ""), reverse=True)
+        releases: list[tuple[str, Literal["True", "False", "Unknown"]]] = []
+        for item in matches:
+            name = (item.get("metadata", {}) or {}).get("name")
+            if name:
+                releases.append((name, self._released_status(item)))
+        return releases
+
+    @staticmethod
+    def _released_status(item: dict) -> Literal["True", "False", "Unknown"]:
+        """Effective ``Released``-condition status of a Release list item.
+
+        Mirrors :meth:`get_release_status`: True on success, False only on a terminal
+        failure (reason != "Progressing"), Unknown while in flight or unset.
+        """
+        released = next(
+            (c for c in item.get("status", {}).get("conditions", []) if c.get("type") == "Released"),
+            None,
+        )
+        if released is None:
+            return "Unknown"
+        status = released.get("status", "")
+        reason = released.get("reason", "")
+        if status == "True":
+            return "True"
+        if status == "False" and reason != "Progressing":
+            return "False"
+        return "Unknown"
 
     def get_snapshot_test_status(
         self, snapshot_name: str, snap: dict | None = None
