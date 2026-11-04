@@ -18,6 +18,7 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
+import requests
 
 from import_orchestrator.clients import KubeClient
 from import_orchestrator.database import WorkflowDatabase
@@ -26,6 +27,7 @@ from import_orchestrator.engine import (
     ImportOrchestrator,
     ImportTrigger,
     PipelineMonitor,
+    Reconciler,
     ReleaseMonitor,
     RequestView,
 )
@@ -105,6 +107,9 @@ def mock_kube():
     # care about the ITS gate override this explicitly.
     kube.get_snapshot_test_status.return_value = "passed"
     kube.get_snapshot_test_failure_detail.return_value = None
+    # Reconciliation defaults: nothing on the cluster unless a test says otherwise.
+    kube.find_intake_pipelineruns_by_fingerprint.return_value = []
+    kube.list_releases_for_snapshot_and_plan.return_value = []
     return kube
 
 
@@ -229,3 +234,63 @@ class TestStatistics:
         stats = orchestrator.view.statistics()
         assert set(stats) == {"pending", "running", "releasing", "success", "failed"}
         assert stats["running"] == 1
+
+
+class TestReconcileIntegration:
+    def _orchestrator(self, db: WorkflowDatabase, mock_kube) -> ImportOrchestrator:
+        view = RequestView(db, skip_release=False)
+        trigger = ImportTrigger(
+            view=view,
+            kube=mock_kube,
+            build_pipelinerun=MagicMock(return_value={"kind": "PipelineRun"}),
+            max_parallel=5,
+            max_retries=3,
+        )
+        return ImportOrchestrator(
+            view=view,
+            trigger=trigger,
+            pipeline_monitor=PipelineMonitor(view=view, kube=mock_kube),
+            release_monitor=ReleaseMonitor(view=view, kube=mock_kube, max_parallel=5, prefix="pnc-import-"),
+            poll_interval=0,
+            max_retries=3,
+            reconciler=Reconciler(view=view, kube=mock_kube),
+        )
+
+    def test_reconcile_prevents_duplicate_intake(self, db: WorkflowDatabase, mock_kube):
+        """Headline AC: an empty cache with a completed workflow already on the cluster is
+        adopted by reconciliation, so the loop never triggers a duplicate intake."""
+        request = _seed_request(db, "r1")
+        mock_kube.find_intake_pipelineruns_by_fingerprint.return_value = [
+            PipelineRunStatus(name="pnc-import-existing", status="True")
+        ]
+        mock_kube.find_snapshot_by_pipelinerun.return_value = "snap-1"
+        mock_kube.get_snapshot_test_status.return_value = "passed"
+        mock_kube.list_releases_for_snapshot_and_plan.return_value = [("rel-1", "True")]
+
+        exit_code = self._orchestrator(db, mock_kube).run_until_complete()
+
+        assert exit_code == 0
+        mock_kube.create_pipelinerun.assert_not_called()
+        # The completed cluster workflow was actually adopted (not just "no create").
+        phases = db.latest_phase_map(request.id)
+        assert phases[Phase.INTAKE].reference_id == "pnc-import-existing"
+        assert phases[Phase.SNAPSHOT].reference_id == "snap-1"
+        assert phases[Phase.INTEGRATION_TESTS].status == PhaseStatus.SUCCESS
+        assert phases[Phase.RELEASE].reference_id == "rel-1"
+        assert phases[Phase.RELEASE].status == PhaseStatus.SUCCESS
+
+    def test_reconcile_failure_does_not_trigger_duplicate(self, db: WorkflowDatabase, mock_kube):
+        """If the cluster cannot be read during reconcile, the Request is skipped this run:
+        it must not be triggered, or a transient error would duplicate in-flight work."""
+        _seed_request(db, "r1")
+        mock_kube.find_intake_pipelineruns_by_fingerprint.side_effect = requests.HTTPError("503")
+
+        exit_code = self._orchestrator(db, mock_kube).run_until_complete()
+
+        assert exit_code == 0
+        mock_kube.create_pipelinerun.assert_not_called()
+
+    def test_reconciler_is_optional(self, orchestrator: ImportOrchestrator, mock_kube):
+        """The default orchestrator fixture has no reconciler; it must still run."""
+        assert orchestrator.run_until_complete() == 0
+        mock_kube.find_intake_pipelineruns_by_fingerprint.assert_not_called()
