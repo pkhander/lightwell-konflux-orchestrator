@@ -74,6 +74,21 @@ class ClusterResource(str, Enum):
     RELEASE = "release"
 
 
+class PruneOutcome(str, Enum):
+    """Result of deleting a Request's cluster resources (LWLP-5515).
+
+    ``DELETED`` means every targeted resource is gone (deleted now or already
+    absent). ``RETRY`` is a transient failure the caller should attempt again on a
+    later cycle. ``FORBIDDEN`` is an RBAC denial (HTTP 403): a permanent condition
+    for the run, so the caller should stop pruning rather than re-issuing a request
+    that will 403 every cycle.
+    """
+
+    DELETED = "deleted"
+    RETRY = "retry"
+    FORBIDDEN = "forbidden"
+
+
 class Phase(str, Enum):
     """One of the four phases of a release workflow (ADR-0001)."""
 
@@ -124,7 +139,7 @@ class Request:
     """An intent to release a single artifact for a specific target.
 
     The combination of (namespace, application, component, pipeline,
-    release_plan, target, artifact) is the request's fingerprint and is unique:
+    release_plan, target, artifact, source_repo) is the request's fingerprint and is unique:
     re-importing the same artifact for the same target returns the existing
     Request rather than creating a duplicate.
     """
@@ -138,6 +153,9 @@ class Request:
     artifact: str
     target: str
     created_at: datetime | None = None
+    source_repo: str = ""
+    # Set once the Request's cluster resources have been pruned; None while live.
+    pruned_at: datetime | None = None
 
 
 @dataclass(frozen=True)

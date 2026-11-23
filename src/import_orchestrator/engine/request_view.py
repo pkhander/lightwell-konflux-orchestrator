@@ -33,12 +33,16 @@ class RequestView:
 
     Retry eligibility matches the legacy flat model: with N attempts recorded, a
     failed Request is retriable while ``attempt_count <= max_retries`` (i.e. up to
-    ``max_retries`` retries after the first attempt).
+    ``max_retries`` retries after the first attempt). A Request whose ``pruned_at`` is
+    set is never retriable: its cluster objects have been deleted, so a later run with a
+    higher ``--max-retries`` must not revive it against resources that no longer exist.
     """
 
-    def __init__(self, db: WorkflowDatabase, skip_release: bool):
+    def __init__(self, db: WorkflowDatabase, skip_release: bool, *, request_ids: set[int] | None = None):
         self.db = db
         self.skip_release = skip_release
+        # None selects the whole database; an empty set selects no requests.
+        self.request_ids = request_ids
 
     def state(self, request: Request) -> RequestState:
         """Return the overall :class:`RequestState` of a Request."""
@@ -46,8 +50,11 @@ class RequestView:
         return derive_state(self.db.latest_phase_map(request.id), self.skip_release)
 
     def requests(self) -> list[Request]:
-        """Return every Request, ordered by id."""
-        return self.db.list_requests()
+        """Return requests in this invocation's scope, ordered by id."""
+        requests = self.db.list_requests()
+        if self.request_ids is None:
+            return requests
+        return [request for request in requests if request.id in self.request_ids]
 
     def pending(self) -> list[Request]:
         """Requests awaiting their first (or a recovered) intake trigger.
@@ -62,9 +69,19 @@ class RequestView:
         """Failed Requests still eligible for another attempt."""
         return [r for r in self.requests() if self._is_retriable(r, max_retries)]
 
-    def in_flight_count(self) -> int:
-        """Count Requests actively being processed (running or awaiting release)."""
-        return sum(1 for r in self.requests() if self.state(r) in (RequestState.RUNNING, RequestState.AWAITING_RELEASE))
+    def in_flight_count(self, skip_ids: set[int] | None = None) -> int:
+        """Count Requests actively being processed (running or awaiting release).
+
+        ``skip_ids`` are Requests reconcile could not read this run. They stay out of
+        the parallel slot count, so one unreadable in-flight Request cannot block
+        every other Request while completion is already ignoring it.
+        """
+        skip = skip_ids or set()
+        return sum(
+            1
+            for r in self.requests()
+            if r.id not in skip and self.state(r) in (RequestState.RUNNING, RequestState.AWAITING_RELEASE)
+        )
 
     def statistics(self) -> dict[str, int]:
         """Return counts grouped by :class:`RequestState` value, for reporting."""
@@ -73,9 +90,17 @@ class RequestView:
             stats[self.state(r).value] += 1
         return stats
 
-    def is_complete(self, max_retries: int) -> bool:
-        """True when no Request is still in flight or retriable."""
+    def is_complete(self, max_retries: int, skip_ids: set[int] | None = None) -> bool:
+        """True when no Request is still in flight or retriable.
+
+        ``skip_ids`` are Requests the reconciler could not read this run; they are
+        neither triggered nor counted toward completion, so one unreadable Request does
+        not hang the loop -- it is deferred to the next invocation.
+        """
+        skip = skip_ids or set()
         for r in self.requests():
+            if r.id in skip:
+                continue
             st = self.state(r)
             if st in (RequestState.PENDING, RequestState.RUNNING, RequestState.AWAITING_RELEASE):
                 return False
@@ -83,7 +108,13 @@ class RequestView:
                 return False
         return True
 
+    def is_retriable(self, request: Request, max_retries: int) -> bool:
+        """Public: whether a FAILED Request is still eligible for another attempt."""
+        return self._is_retriable(request, max_retries)
+
     def _is_retriable(self, request: Request, max_retries: int) -> bool:
-        if request.id is None:
+        # A pruned Request is finished: its objects are gone, so raising --max-retries
+        # must not revive it (it would resume against a deleted Snapshot, LWLP-5515).
+        if request.id is None or request.pruned_at is not None:
             return False
         return self.state(request) == RequestState.FAILED and self.db.attempt_count(request.id) <= max_retries

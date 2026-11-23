@@ -49,6 +49,16 @@ def _make_request(store: WorkflowDatabase, **overrides):
 
 
 class TestRequests:
+    def test_different_source_repository_creates_new_request(self, store):
+        first, _ = _make_request(store, source_repo="https://example.com/original.git")
+        second, inserted = _make_request(store, source_repo="https://example.com/other.git")
+        assert inserted
+        assert second.id != first.id
+        assert store.get_request(second.id).source_repo == "https://example.com/other.git"
+        again, inserted = _make_request(store, source_repo=first.source_repo)
+        assert not inserted
+        assert again.id == first.id
+
     def test_get_or_create_inserts_new(self, store: WorkflowDatabase):
         request, was_inserted = _make_request(store)
         assert was_inserted is True
@@ -99,6 +109,33 @@ class TestRequests:
         requests = store.list_requests()
         assert len(requests) == 2
         assert [r.target for r in requests] == ["remediated", "novel"]
+
+
+class TestPruning:
+    def test_new_request_is_not_pruned(self, store: WorkflowDatabase):
+        request, _ = _make_request(store)
+        assert request.pruned_at is None
+        assert store.get_request(request.id).pruned_at is None
+
+    def test_mark_pruned_stamps_timezone_aware_utc_timestamp(self, store: WorkflowDatabase):
+        request, _ = _make_request(store)
+
+        store.mark_pruned(request.id)
+
+        pruned_at = store.get_request(request.id).pruned_at
+        assert pruned_at is not None
+        assert pruned_at.tzinfo is not None
+        assert pruned_at.utcoffset() == timedelta(0)
+        # list_requests surfaces the same value the prune monitor reads each cycle.
+        assert store.list_requests()[0].pruned_at == pruned_at
+
+    def test_mark_pruned_is_idempotent(self, store: WorkflowDatabase):
+        request, _ = _make_request(store)
+        store.mark_pruned(request.id)
+        first = store.get_request(request.id).pruned_at
+        store.mark_pruned(request.id)
+        second = store.get_request(request.id).pruned_at
+        assert first is not None and second is not None
 
     def test_created_at_is_timezone_aware_utc(self, store: WorkflowDatabase):
         request, _ = _make_request(store)

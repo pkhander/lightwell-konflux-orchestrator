@@ -93,6 +93,14 @@ def mock_kube():
     # release logic; the ITS gate itself is covered by TestIntegrationTestGate.
     m.get_snapshot_test_status.return_value = "passed"
     m.get_snapshot_test_failure_detail.return_value = None
+    # Release-failure enrichment is opt-in per test: default to no extra detail and
+    # no resolvable application so the generic fallback path is exercised unless a
+    # test sets these explicitly.
+    m.get_release_failure_detail.return_value = None
+    m.get_snapshot_application.return_value = None
+    m.release_url.side_effect = lambda app, name: (
+        f"https://konflux-ui.example/ns/lightwell-poc-tenant/applications/{app}/releases/{name}"
+    )
     return m
 
 
@@ -336,6 +344,45 @@ class TestCheckReleaseCompletion:
         assert release.status == PhaseStatus.FAILED
         assert release.error_message == "Release release-456 failed"
         assert monitor.view.state(request) == RequestState.FAILED
+
+    def test_failure_detail_is_recorded_and_logged(
+        self, monitor: ReleaseMonitor, db: WorkflowDatabase, mock_kube: MagicMock, capsys: pytest.CaptureFixture[str]
+    ):
+        """A Release failure detail replaces the opaque message and is printed."""
+        request = _seed(db, "r1", snapshot="snapshot-123", release="release-456")
+        mock_kube.get_release_status.return_value = "False"
+        mock_kube.get_release_failure_detail.return_value = "Failed - managed pipeline failed"
+
+        monitor.update_statuses()
+
+        assert _phase(db, request, Phase.RELEASE).error_message == "Failed - managed pipeline failed"
+        assert "Failed - managed pipeline failed" in capsys.readouterr().err
+
+    def test_release_url_logged_when_application_known(
+        self, monitor: ReleaseMonitor, db: WorkflowDatabase, mock_kube: MagicMock, capsys: pytest.CaptureFixture[str]
+    ):
+        """A failed Release logs a Konflux UI link built from the snapshot's application."""
+        _seed(db, "r1", snapshot="snapshot-123", release="release-456")
+        mock_kube.get_release_status.return_value = "False"
+        mock_kube.get_snapshot_application.return_value = "python-sdist-mirror"
+
+        monitor.update_statuses()
+
+        mock_kube.get_snapshot_application.assert_called_once_with("snapshot-123")
+        mock_kube.release_url.assert_called_once_with("python-sdist-mirror", "release-456")
+        assert "applications/python-sdist-mirror/releases/release-456" in capsys.readouterr().err
+
+    def test_no_url_logged_when_application_unknown(
+        self, monitor: ReleaseMonitor, db: WorkflowDatabase, mock_kube: MagicMock
+    ):
+        """When the application label can't be read, no link is built (failure still logged)."""
+        _seed(db, "r1", snapshot="snapshot-123", release="release-456")
+        mock_kube.get_release_status.return_value = "False"
+        mock_kube.get_snapshot_application.return_value = None
+
+        monitor.update_statuses()
+
+        mock_kube.release_url.assert_not_called()
 
     def test_waits_when_release_still_running(
         self, monitor: ReleaseMonitor, db: WorkflowDatabase, mock_kube: MagicMock

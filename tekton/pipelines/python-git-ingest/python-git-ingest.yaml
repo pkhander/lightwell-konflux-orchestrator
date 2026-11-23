@@ -1,0 +1,186 @@
+---
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: python-git-ingest
+  annotations:
+    tekton.dev/pipelines.minVersion: 0.12.1
+    tekton.dev/tags: python, git, ingestion, lightwell, konflux
+  labels:
+    app.kubernetes.io/version: "0.1"
+spec:
+  description: >-
+    Phase 1 Source Ingestion Pipeline (git route): clone an upstream Python package's git
+    repository, resolve the configured ref to an exact commit SHA, package that checkout as
+    a git-source OCI artifact, run ClamAV security scans, and output a signed SLSA
+    provenance Snapshot. This is the counterpart to python-sdist-ingest for packages whose
+    canonical source (resolve_canonical_source()) is a git repository rather than a
+    PyPI/RHTL sdist — no fromager normalization applies, since there is no sdist to
+    normalize.
+
+    Pipeline flow:
+      1. fetch-git-source: Clones UPSTREAM_URL at UPSTREAM_REF (taisce-cuan task, resolved
+         via git resolver), resolves the ref to an exact commit SHA, and produces a Trusted
+         Artifact (SOURCE_ARTIFACT) of the checked-out tree.
+      2. package-git-source-image: Packages SOURCE_ARTIFACT as a git-source OCI artifact
+         Snapshot, producing the same IMAGE_URL/IMAGE_DIGEST/IMAGE_REF/CHAINS-GIT_* result
+         shape python-sdist-ingest's fromager-build-sdist task produces.
+      3. clamav-scan: Scans the git-source artifact for malware.
+      4. Auto-release triggers managed python-sdist-mirror to commit source + provenance
+         to lightwell-builds/pypi.org-<package>.
+
+  params:
+    - name: PACKAGE
+      description: Canonical Python package name (PEP 503 normalized).
+      type: string
+    - name: VERSION
+      description: Package version string.
+      type: string
+    - name: IMAGE
+      description: Destination OCI artifact reference for the git-source Snapshot (e.g. quay.io/.../git-source:pkg-ver).
+      type: string
+    - name: UPSTREAM_URL
+      description: URL of the upstream git repository to clone.
+      type: string
+    - name: UPSTREAM_REF
+      description: Git ref (tag, branch, or commit) to resolve and check out.
+      type: string
+    - name: SOURCE_TYPE
+      description: >-
+        Canonical source type this pipeline ingests. Always "git". No task in this
+        pipeline reads it — it exists solely so it lands in the PipelineRun's params and
+        is captured by Tekton Chains into the SLSA provenance attestation's
+        predicate.invocation.parameters. release-service-catalog's extract-py-artifacts
+        task reads it back out from there (jq '.predicate.invocation.parameters.SOURCE_TYPE')
+        to route python-sdist-mirror's archive-sources call between the git and sdist
+        param shapes, since SOURCE_TYPE isn't otherwise observable downstream of the
+        build once the triggering PipelineRun is gone.
+      type: string
+      default: "git"
+    - name: ociStorage
+      description: OCI reference used as the store for Trusted Artifacts.
+      type: string
+      default: ""
+    - name: ociArtifactExpiresAfter
+      description: Expiration for Trusted Artifact OCI objects.
+      type: string
+      default: ""
+    - name: IMAGE_EXPIRES_AFTER
+      description: Expiration for the git-source OCI artifact.
+      type: string
+      default: ""
+    - name: caTrustConfigMapName
+      description: The name of the ConfigMap to read CA bundle data from.
+      type: string
+      default: trusted-ca
+    - name: caTrustConfigMapKey
+      description: The name of the key in the ConfigMap that contains the CA bundle data.
+      type: string
+      default: ca-bundle.crt
+    - name: git-url
+      description: Source git repository URL for Konflux Integration Snapshot attribution.
+      type: string
+      default: https://gitlab.cee.redhat.com/lightwell/konflux-definitions/python-remediated-exploration.git
+    - name: revision
+      description: Git commit revision for Konflux Integration Snapshot attribution.
+      type: string
+      default: main
+
+  results:
+    - name: IMAGE_URL
+      description: OCI artifact repository and tag where the git source was pushed.
+      value: $(tasks.package-git-source-image.results.IMAGE_URL)
+    - name: IMAGE_DIGEST
+      description: Digest of the git-source OCI artifact.
+      value: $(tasks.package-git-source-image.results.IMAGE_DIGEST)
+    - name: IMAGE_REF
+      description: Full OCI reference (repo@digest) of the git-source artifact.
+      value: $(tasks.package-git-source-image.results.IMAGE_REF)
+    - name: CHAINS-GIT_URL
+      description: Source git repository URL for Tekton Chains / Snapshot.
+      value: $(tasks.package-git-source-image.results.CHAINS-GIT_URL)
+    - name: CHAINS-GIT_COMMIT
+      description: Git commit SHA for Tekton Chains / Snapshot.
+      value: $(tasks.package-git-source-image.results.CHAINS-GIT_COMMIT)
+
+  tasks:
+    # ── Step 1: Clone upstream git source & resolve ref to exact commit SHA ───
+    - name: fetch-git-source
+      taskRef:
+        resolver: bundles
+        params:
+          - name: bundle
+            value: quay.io/light-factory/tekton-catalog/task-fetch-git-source@sha256:5ea4805ebe747228557616953ef723dee1b83987c29743f3407f29d305a9d21f
+          - name: name
+            value: fetch-git-source
+          - name: kind
+            value: task
+      params:
+        - name: packageName
+          value: $(params.PACKAGE)
+        - name: packageVersion
+          value: $(params.VERSION)
+        - name: upstreamUrl
+          value: $(params.UPSTREAM_URL)
+        - name: ref
+          value: $(params.UPSTREAM_REF)
+        - name: ociStorage
+          value: $(params.ociStorage)
+        - name: ociArtifactExpiresAfter
+          value: $(params.ociArtifactExpiresAfter)
+        - name: caTrustConfigMapName
+          value: $(params.caTrustConfigMapName)
+        - name: caTrustConfigMapKey
+          value: $(params.caTrustConfigMapKey)
+
+    # ── Step 2: Package the git checkout as an OCI artifact Snapshot ──────────
+    - name: package-git-source-image
+      runAfter:
+        - fetch-git-source
+      taskRef:
+        resolver: bundles
+        params:
+          - name: bundle
+            value: quay.io/light-factory/tekton-catalog/task-package-git-source-image@sha256:ab212d2c9abe1a26bacea1e0a05599f459aee681cc498ce7cbddafd5484475fa
+          - name: name
+            value: package-git-source-image
+          - name: kind
+            value: task
+      params:
+        - name: SOURCE_ARTIFACT
+          value: $(tasks.fetch-git-source.results.SOURCE_ARTIFACT)
+        - name: PACKAGE
+          value: $(params.PACKAGE)
+        - name: VERSION
+          value: $(params.VERSION)
+        - name: IMAGE
+          value: $(params.IMAGE)
+        - name: IMAGE_EXPIRES_AFTER
+          value: $(params.IMAGE_EXPIRES_AFTER)
+        - name: caTrustConfigMapName
+          value: $(params.caTrustConfigMapName)
+        - name: caTrustConfigMapKey
+          value: $(params.caTrustConfigMapKey)
+        - name: git-url
+          value: $(params.git-url)
+        - name: revision
+          value: $(params.revision)
+
+    # ── Step 3: ClamAV Antivirus Scan ─────────────────────────────────────────
+    - name: clamav-scan
+      taskRef:
+        resolver: bundles
+        params:
+          - name: name
+            value: clamav-scan
+          - name: bundle
+            value: quay.io/konflux-ci/tekton-catalog/task-clamav-scan:0.3.4@sha256:3203cd3bde82d9e4d1beb5f1366942346800cff89e392c920733eb0ea78d731b
+          - name: kind
+            value: task
+      params:
+        - name: image-digest
+          value: $(tasks.package-git-source-image.results.IMAGE_DIGEST)
+        - name: image-url
+          value: $(tasks.package-git-source-image.results.IMAGE_URL)
+      runAfter:
+        - package-git-source-image

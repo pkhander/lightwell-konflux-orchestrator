@@ -15,11 +15,12 @@ limitations under the License.
 """
 
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 
 from import_orchestrator.database import WorkflowDatabase
-from import_orchestrator.engine import RequestView
+from import_orchestrator.engine import PipelineMonitor, ReleaseMonitor, RequestView
 from import_orchestrator.models import ClusterResource, Phase, PhaseStatus, Request, RequestState
 
 
@@ -80,6 +81,38 @@ class TestState:
 
 
 class TestSelectors:
+    def test_scope_applies_to_all_selectors(self, db):
+        selected = _pending(db, "selected")
+        _running(db, "other-running")
+        _failed(db, "other-failed")
+        view = RequestView(db, skip_release=False, request_ids={selected.id})
+        assert view.requests() == [selected]
+        assert view.pending() == [selected]
+        assert view.retry_candidates(3) == []
+        assert view.in_flight_count() == 0
+        assert view.statistics() == {"pending": 1, "running": 0, "releasing": 0, "success": 0, "failed": 0}
+        assert not view.is_complete(3)
+
+    def test_empty_scope_is_complete_even_with_pending_requests(self, db):
+        _pending(db, "other")
+        view = RequestView(db, skip_release=False, request_ids=set())
+        assert view.requests() == []
+        assert view.is_complete(3)
+
+    @pytest.mark.parametrize("intake_status", [PhaseStatus.RUNNING, PhaseStatus.SUCCESS])
+    def test_monitors_leave_requests_outside_scope_untouched(self, db, intake_status):
+        selected = _pending(db, "selected")
+        other = _running(db, "other")
+        attempt = db.latest_attempt(other.id)
+        db.upsert_phase(attempt.id, Phase.INTAKE, intake_status, ClusterResource.PIPELINE_RUN, "other")
+        phases_before = db.latest_phase_map(other.id)
+        view = RequestView(db, skip_release=True, request_ids={selected.id})
+        kube = MagicMock()
+        PipelineMonitor(view, kube).update_statuses()
+        ReleaseMonitor(view, kube, max_parallel=5, prefix="python-build-").update_statuses()
+        assert kube.mock_calls == []
+        assert db.latest_phase_map(other.id) == phases_before
+
     def test_pending_lists_only_unattempted(self, db, view):
         _pending(db, "p1")
         _running(db, "r1")
@@ -92,11 +125,30 @@ class TestSelectors:
         _pending(db, "p1")
         assert view.in_flight_count() == 2
 
+    def test_in_flight_count_excludes_skipped_ids(self, db, view):
+        skipped = _running(db, "r1")
+        _running(db, "r2")
+        assert view.in_flight_count(skip_ids={skipped.id}) == 1
+
     def test_retry_candidates_respect_max_retries(self, db, view):
         _failed(db, "retriable", attempts=1)
         _failed(db, "exhausted", attempts=4)  # 4 > max_retries=3
         candidates = view.retry_candidates(max_retries=3)
         assert [r.artifact for r in candidates] == ["retriable"]
+
+    def test_pruned_failure_is_never_retriable(self, db, view):
+        # A pruned failure is finished: raising --max-retries must not revive it against
+        # the Snapshot/Release prune already deleted (LWLP-5515).
+        pruned = _failed(db, "pruned", attempts=4)
+        db.mark_pruned(pruned.id)
+
+        assert view.retry_candidates(max_retries=10) == []
+        assert view.is_complete(max_retries=10) is True
+
+    def test_unpruned_failure_within_retries_is_still_retriable(self, db, view):
+        # Guard against the pruned_at gate over-reaching: an ordinary failure is unaffected.
+        _failed(db, "live", attempts=1)
+        assert [r.artifact for r in view.retry_candidates(max_retries=3)] == ["live"]
 
     def test_statistics(self, db, view):
         _pending(db, "p1")

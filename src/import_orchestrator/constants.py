@@ -22,6 +22,13 @@ NAMESPACE = "lightwell-poc-tenant"
 CLUSTER_API = "https://api.stone-prod-p01.wcfb.p1.openshiftapps.com:6443"
 KUBEARCHIVE_API = "https://kubearchive-api-server-product-kubearchive.apps.stone-prod-p01.wcfb.p1.openshiftapps.com"
 
+# Base of the Konflux UI, up to and including the namespace path segment.
+KONFLUX_UI_NS_BASE = "https://konflux-ui.apps.stone-prod-p01.wcfb.p1.openshiftapps.com/ns"
+# Template for a Release page in the Konflux UI; fill the named fields with
+# ``KONFLUX_RELEASE_URL_TEMPLATE.format(namespace=..., application=..., name=...)``.
+# Used to turn a failed Release into a clickable link in the orchestrator's logs.
+KONFLUX_RELEASE_URL_TEMPLATE = KONFLUX_UI_NS_BASE + "/{namespace}/applications/{application}/releases/{name}"
+
 # Label carrying a Request's fingerprint on the resources the orchestrator creates
 # (intake PipelineRun, Release). The ``custom.appstudio.openshift.io/`` prefix is
 # the one Konflux's integration service propagates onto the resulting Snapshot and

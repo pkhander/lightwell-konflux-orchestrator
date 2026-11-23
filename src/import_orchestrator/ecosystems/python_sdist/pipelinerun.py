@@ -19,6 +19,7 @@ from __future__ import annotations
 from typing import Any
 
 from import_orchestrator.ecosystems.base import DEFAULT_PIPELINERUN_ANNOTATIONS
+from import_orchestrator.ecosystems.python.identifiers import image_tag, version_label
 from import_orchestrator.engine.errors import TriggerError
 
 __all__ = ["TriggerError", "build_pipelinerun_manifest", "parse_ref"]
@@ -49,23 +50,43 @@ def build_pipelinerun_manifest(
     source_registries: str = "rhtl",
     pipeline_git_url: str | None = None,
     pipeline_revision: str | None = None,
+    source_type: str = "pypi-sdist",
+    upstream_url: str | None = None,
+    upstream_ref: str | None = None,
 ) -> dict[str, Any]:
-    """Build a python-sdist-ingest PipelineRun manifest for one package/version.
+    """Build a python-sdist-ingest or python-git-ingest PipelineRun manifest.
 
     ``pipeline_git_url`` and ``pipeline_revision`` identify the repository and
     immutable commit that supplied this inline pipeline definition to Chains.
+
+    ``source_type`` selects the param set: the default ``"pypi-sdist"`` builds
+    params for the sdist-mirror pipeline; ``"git"`` builds params for the
+    git-ingest pipeline instead, requiring ``upstream_url``/``upstream_ref``.
     """
     if bool(pipeline_git_url) != bool(pipeline_revision):
         raise TriggerError("inline pipeline Git URL and revision must be supplied together")
 
-    image = f"{image_repo_base}/{application}/{component}:{package}-{version}"
-    params = [
-        {"name": "PACKAGE", "value": package},
-        {"name": "VERSION", "value": version},
-        {"name": "IMAGE", "value": image},
-        {"name": "SOURCE_REGISTRIES", "value": source_registries},
-        {"name": "ociStorage", "value": f"{image}.src"},
-    ]
+    image = f"{image_repo_base}/{application}/{component}:{image_tag(package, version)}"
+    if source_type == "git":
+        if not (upstream_url and upstream_ref):
+            raise TriggerError("upstream_url and upstream_ref must both be supplied for git source_type")
+        params = [
+            {"name": "PACKAGE", "value": package},
+            {"name": "VERSION", "value": version},
+            {"name": "IMAGE", "value": image},
+            {"name": "UPSTREAM_URL", "value": upstream_url},
+            {"name": "UPSTREAM_REF", "value": upstream_ref},
+            {"name": "SOURCE_TYPE", "value": source_type},
+            {"name": "ociStorage", "value": f"{image}.src"},
+        ]
+    else:
+        params = [
+            {"name": "PACKAGE", "value": package},
+            {"name": "VERSION", "value": version},
+            {"name": "IMAGE", "value": image},
+            {"name": "SOURCE_REGISTRIES", "value": source_registries},
+            {"name": "ociStorage", "value": f"{image}.src"},
+        ]
     if pipeline_git_url and pipeline_revision:
         params.extend(
             [
@@ -93,7 +114,7 @@ def build_pipelinerun_manifest(
                 "appstudio.openshift.io/component": component,
                 "pipelines.appstudio.openshift.io/type": "build",
                 "lightwell.redhat.com/package": package,
-                "lightwell.redhat.com/version": version,
+                "lightwell.redhat.com/version": version_label(version),
             },
         },
         "spec": spec,

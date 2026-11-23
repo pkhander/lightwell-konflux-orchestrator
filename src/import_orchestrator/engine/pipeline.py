@@ -41,7 +41,7 @@ class PipelineMonitor:
 
     def update_statuses(self) -> None:
         """Check the intake PipelineRun of every in-progress Request and update it."""
-        for request in self.db.list_requests():
+        for request in self.view.requests():
             assert request.id is not None
             intake = self.db.latest_phase_map(request.id).get(Phase.INTAKE)
             if intake is None or intake.attempt_id is None:

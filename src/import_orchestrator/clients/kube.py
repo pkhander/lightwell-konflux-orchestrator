@@ -18,13 +18,14 @@ from __future__ import annotations
 
 import json
 import sys
+from collections.abc import Iterable
 from typing import Literal
 
 import requests
 
 from import_orchestrator.clients.kube_api import KubeAPI, KubeAuth, resolve_auth
-from import_orchestrator.constants import FINGERPRINT_LABEL
-from import_orchestrator.models import PipelineRunStatus
+from import_orchestrator.constants import FINGERPRINT_LABEL, KONFLUX_RELEASE_URL_TEMPLATE
+from import_orchestrator.models import PipelineRunStatus, PruneOutcome
 
 
 def _api_error_detail(exc: requests.RequestException) -> str:
@@ -265,8 +266,143 @@ class KubeClient:
         running_prs = self.get_running_pipelineruns()
         return sum(1 for pr in running_prs if pr.name.startswith(prefix))
 
-    def find_snapshot_by_pipelinerun(self, pr_name: str) -> str | None:
-        """Find the Snapshot created by a specific PipelineRun via its label."""
+    def delete_request_resources(
+        self,
+        *,
+        releases: Iterable[str] = (),
+        snapshots: Iterable[str] = (),
+    ) -> PruneOutcome:
+        """Delete the given Releases and Snapshots, one ``DELETE`` per name.
+
+        A 404 counts as gone. ``DELETED`` means every delete was accepted;
+        finalizers may still leave the object Terminating. A 403 returns
+        ``FORBIDDEN`` and takes precedence over any other error, which returns
+        ``RETRY``.
+        """
+        targets = [
+            (kind, name, f"/apis/{group}/namespaces/{self.namespace}/{plural}/{name}")
+            for kind, names, group, plural in (
+                ("Release", releases, "appstudio.redhat.com/v1alpha1", "releases"),
+                ("Snapshot", snapshots, "appstudio.redhat.com/v1alpha1", "snapshots"),
+            )
+            for name in sorted(set(names))
+        ]
+
+        forbidden = False
+        retry = False
+        for kind, name, api_path in targets:
+            try:
+                self._api.delete(api_path)
+            except requests.RequestException as e:
+                status = getattr(getattr(e, "response", None), "status_code", None)
+                if status == 404:
+                    continue  # already gone -- treat as deleted
+                self._log_api_error(f"prune {kind} {name}", e)
+                if status == 403:
+                    forbidden = True
+                else:
+                    retry = True
+
+        if forbidden:
+            return PruneOutcome.FORBIDDEN
+        if retry:
+            return PruneOutcome.RETRY
+        return PruneOutcome.DELETED
+
+    # Intake PipelineRuns carry type=build. The fingerprint label is also propagated onto
+    # the Snapshot and integration-test PipelineRuns, so scope the query to type=build to
+    # return only intakes.
+    _PIPELINERUN_TYPE_LABEL = "pipelines.appstudio.openshift.io/type"
+
+    def find_intake_pipelinerun_statuses_by_fingerprint(self, fingerprint: str) -> list[PipelineRunStatus]:
+        """Find intake PipelineRuns carrying ``fingerprint``, oldest first.
+
+        Returns a :class:`PipelineRunStatus` per match (its name *and* current status),
+        not just the names, oldest-first.
+
+        Reconciliation entry point (ADR-0001): a run finds the PipelineRuns it stamped
+        with the Request fingerprint instead of trusting the cache. Each Attempt stamps
+        the same (per-Request) fingerprint, so several may match; oldest-first lets the
+        caller rebuild one Attempt per PipelineRun. Live and KubeArchive are merged so a
+        history spanning pruned runs is complete. A PipelineRun with no condition yet is
+        reported RUNNING, not dropped, so a fresh intake is never re-triggered.
+
+        Raises :class:`requests.RequestException` if the *live* list fails: the caller
+        must be able to tell "query failed" from "no PipelineRuns match", because
+        treating a transient error as "nothing exists" would let it create a duplicate
+        intake. A KubeArchive outage only loses pruned history and degrades to live-only.
+        """
+        selector = f"{FINGERPRINT_LABEL}={fingerprint},{self._PIPELINERUN_TYPE_LABEL}=build"
+        items = self._list_pipelineruns_by_label(selector)
+        items.sort(key=lambda item: (item.get("metadata", {}) or {}).get("creationTimestamp", ""))
+        statuses = []
+        for item in items:
+            if pr_status := self._pipelinerun_status_from_item(item):
+                statuses.append(pr_status)
+        return statuses
+
+    def _list_pipelineruns_by_label(self, selector: str) -> list[dict]:
+        """List PipelineRuns matching a label selector, merging live and KubeArchive.
+
+        The live list is authoritative for in-flight work and is not error-masked: a
+        failed live query re-raises so the caller can distinguish it from an empty
+        result (treating a transient error as "nothing exists" would let the caller
+        create a duplicate). KubeArchive only supplies pruned history, so its outage
+        degrades to [] and simply merges nothing. Live items first, then
+        KubeArchive-only items (deduplicated by name).
+
+        Raises :class:`requests.RequestException` when the live list fails; this is the
+        origin of the same exception documented on the public callers.
+        """
+        path = f"/apis/tekton.dev/v1/namespaces/{self.namespace}/pipelineruns"
+        items = self._list_by_label(self._api, path, selector, source="cluster", raise_on_error=True)
+        if self._ka_api is not None:
+            archived = self._list_by_label(self._ka_api, path, selector, source="KubeArchive", raise_on_error=False)
+            seen = {(item.get("metadata", {}) or {}).get("name") for item in items}
+            items = items + [i for i in archived if (i.get("metadata", {}) or {}).get("name") not in seen]
+        return items
+
+    def _list_by_label(
+        self, api: KubeAPI, path: str, selector: str, *, source: str, raise_on_error: bool
+    ) -> list[dict]:
+        """GET a label-filtered list from one API.
+
+        The error is always logged. With ``raise_on_error`` it then re-raises (the
+        caller must tell a failed query from an empty one); otherwise it degrades to [].
+        """
+        try:
+            result = api.list(path, labelSelector=selector)
+            return result.get("items", [])
+        except requests.RequestException as e:
+            self._log_api_error(f"list resources by label {selector}", e, source=source, ignore_not_found=True)
+            if raise_on_error:
+                raise
+            return []
+
+    @staticmethod
+    def _pipelinerun_status_from_item(item: dict) -> PipelineRunStatus | None:
+        """Map a PipelineRun list item to a status, or None if unnamed.
+
+        No recognised condition means the run just started: report RUNNING so the caller
+        does not re-trigger it.
+        """
+        name = (item.get("metadata", {}) or {}).get("name", "")
+        if not name:
+            return None
+        cond = KubeClient._succeeded_condition(item)
+        status = cond.get("status", "") if cond else ""
+        if status not in ("True", "False", "Unknown"):
+            status = "Unknown"
+        return PipelineRunStatus(name, status)
+
+    def find_snapshot_by_pipelinerun(self, pr_name: str, *, raise_on_error: bool = False) -> str | None:
+        """Find the Snapshot created by a specific PipelineRun via its label.
+
+        Returns None when no Snapshot matches. A live-list error also returns None so
+        the release monitor can retry on the next poll. ``raise_on_error`` is for
+        reconcile: a failed query must not look like "no Snapshot yet", or the cache
+        is written without the Release chain and the monitor creates a duplicate.
+        """
         try:
             result = self._api.list(
                 f"/apis/appstudio.redhat.com/v1alpha1/namespaces/{self.namespace}/snapshots",
@@ -276,6 +412,8 @@ class KubeClient:
             return items[0]["metadata"]["name"] if items else None
         except requests.RequestException as e:
             self._log_api_error(f"find Snapshot for PipelineRun {pr_name}", e)
+            if raise_on_error:
+                raise
             return None
         except (KeyError, IndexError):
             return None
@@ -455,6 +593,60 @@ class KubeClient:
         except KeyError:
             return None
 
+    def list_releases_for_snapshot_and_plan(
+        self, snapshot_name: str, release_plan: str | None = None
+    ) -> list[tuple[str, Literal["True", "False", "Unknown"]]]:
+        """List every Release for a snapshot (optionally scoped to a ReleasePlan), newest first.
+
+        Unlike :meth:`find_release_for_snapshot_and_plan`, this does *not* filter out
+        terminally-failed Releases: reconciliation needs the complete set so it can
+        count release retries (each terminal Release is one spent Attempt) and record
+        the newest Release's real status. Each entry is ``(name, status)`` where status
+        is the effective ``Released`` condition ("True"/"False"/"Unknown"), newest first
+        by ``creationTimestamp``.
+
+        Raises :class:`requests.RequestException` on a failed list, so the caller can
+        tell "query failed" from "no Releases exist" rather than silently undercounting
+        the retry budget (which would reset ``max_retries`` across a cache wipe).
+        """
+        result = self._api.list(
+            f"/apis/appstudio.redhat.com/v1alpha1/namespaces/{self.namespace}/releases",
+        )
+        matches = []
+        for item in result.get("items", []):
+            spec = item.get("spec", {})
+            if spec.get("snapshot") != snapshot_name:
+                continue
+            if release_plan is not None and spec.get("releasePlan") != release_plan:
+                continue
+            matches.append(item)
+        matches.sort(key=lambda i: i.get("metadata", {}).get("creationTimestamp", ""), reverse=True)
+        releases: list[tuple[str, Literal["True", "False", "Unknown"]]] = []
+        for item in matches:
+            name = (item.get("metadata", {}) or {}).get("name")
+            if name:
+                releases.append((name, self._released_status(item)))
+        return releases
+
+    @staticmethod
+    def _released_status(item: dict) -> Literal["True", "False", "Unknown"]:
+        """Effective ``Released``-condition status of a Release list item.
+
+        Mirrors :meth:`get_release_status`: True on success, False only on a terminal
+        failure (reason != "Progressing"), Unknown while in flight or unset.
+        """
+        released = next(
+            (c for c in item.get("status", {}).get("conditions", []) if c.get("type") == "Released"),
+            None,
+        )
+        if released is None:
+            return "Unknown"
+        status = released.get("status", "")
+        reason = released.get("reason", "")
+        if status == "True" or (status == "False" and reason != "Progressing"):
+            return status
+        return "Unknown"
+
     def get_snapshot_test_status(
         self, snapshot_name: str, snap: dict | None = None
     ) -> Literal["passed", "failed", "pending", "none"] | None:
@@ -611,3 +803,43 @@ class KubeClient:
         except requests.RequestException as e:
             self._log_api_error(f"get Release {release_name} status", e, ignore_not_found=True)
             return None
+
+    def get_release_failure_detail(self, release_name: str) -> str | None:
+        """Summarise why a Release failed, from its ``Released`` condition.
+
+        Reads the ``reason`` and ``message`` of the ``Released`` condition and joins
+        them (``"<reason> - <message>"``), so a failed Release is surfaced with the
+        cluster's own explanation instead of the opaque "Release <name> failed".
+        Returns None when the Release cannot be read or carries no reason/message --
+        callers fall back to the generic message in that case.
+        """
+        release = self._fetch_resource(
+            f"/apis/appstudio.redhat.com/v1alpha1/namespaces/{self.namespace}/releases/{release_name}",
+        )
+        if release is None:
+            return None
+        released = next(
+            (c for c in release.get("status", {}).get("conditions", []) if c.get("type") == "Released"),
+            None,
+        )
+        if released is None:
+            return None
+        detail = " - ".join(p for p in (released.get("reason", ""), released.get("message", "")) if p)
+        return detail or None
+
+    def get_snapshot_application(self, snapshot_name: str) -> str | None:
+        """Read the application a Snapshot belongs to from its label.
+
+        Konflux stamps ``appstudio.openshift.io/application`` on every Snapshot; the
+        Konflux UI nests a Release under that application, so this is needed to build
+        a link to the Release page. Returns None if the Snapshot cannot be read or
+        carries no application label.
+        """
+        snap = self._get_snapshot(snapshot_name, "application")
+        if snap is None:
+            return None
+        return (snap.get("metadata", {}).get("labels") or {}).get("appstudio.openshift.io/application") or None
+
+    def release_url(self, application: str, release_name: str) -> str:
+        """Build the Konflux UI URL for a Release page in this client's namespace."""
+        return KONFLUX_RELEASE_URL_TEMPLATE.format(namespace=self.namespace, application=application, name=release_name)

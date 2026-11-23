@@ -1,0 +1,85 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:recommended"
+  ],
+  "automerge": false,
+  "enabledManagers": [
+    "tekton",
+    "custom.regex"
+  ],
+  "tekton": {
+    "managerFilePatterns": [
+      "/^tekton/pipelines/.*\\.ya?ml$/"
+    ]
+  },
+  "customManagers": [
+    {
+      "customType": "regex",
+      "managerFilePatterns": [
+        "/^tekton/pipelines/.*\\.ya?ml$/"
+      ],
+      "matchStrings": [
+        "default: (?<depName>quay\\.io/light-factory/[a-z0-9-]+):(?<currentValue>latest)@(?<currentDigest>sha256:[a-f0-9]{64})"
+      ],
+      "datasourceTemplate": "docker",
+      "versioningTemplate": "docker"
+    },
+    {
+      "customType": "regex",
+      "managerFilePatterns": [
+        "/^src/import_orchestrator/ecosystems/javascript/config\\.py$/"
+      ],
+      "matchStrings": [
+        "\"(?<depName>quay\\.io/(?:light-factory|konflux-ci/tekton-catalog)/[a-z0-9-]+):\"\\s*\"(?<currentValue>[^\"@]+)@\"\\s*\"(?<currentDigest>sha256:[a-f0-9]{64})\""
+      ],
+      "datasourceTemplate": "docker",
+      "versioningTemplate": "docker"
+    }
+  ],
+  "packageRules": [
+    {
+      "matchManagers": [
+        "tekton",
+        "custom.regex"
+      ],
+      "enabled": false
+    },
+    {
+      "matchManagers": [
+        "custom.regex"
+      ],
+      "matchPackageNames": [
+        "quay.io/light-factory/python-builder-cli",
+        "quay.io/light-factory/fath-cuan",
+        "quay.io/light-factory/npm-builder"
+      ],
+      "enabled": true,
+      "pinDigests": true,
+      "automerge": false
+    },
+    {
+      "matchManagers": [
+        "tekton"
+      ],
+      "matchPackageNames": [
+        "quay.io/light-factory/tekton-catalog/**"
+      ],
+      "enabled": true,
+      "pinDigests": true,
+      "automerge": false
+    },
+    {
+      "matchManagers": [
+        "tekton",
+        "custom.regex"
+      ],
+      "matchPackageNames": [
+        "quay.io/konflux-ci/tekton-catalog/**"
+      ],
+      "enabled": true,
+      "pinDigests": true,
+      "automerge": false
+    }
+  ]
+}

@@ -320,3 +320,25 @@ class TestKubeAPI:
 
         with pytest.raises(requests.HTTPError):
             api.create("/apis/tekton.dev/v1/namespaces/ns/pipelineruns", {})
+
+    def test_delete_constructs_url(self, api):
+        mock_resp = MagicMock()
+        api._mock_session.delete.return_value = mock_resp
+
+        result = api.delete("/apis/appstudio.redhat.com/v1alpha1/namespaces/ns/releases/rel-1")
+
+        api._mock_session.delete.assert_called_once_with(
+            "https://api.example.com:6443/apis/appstudio.redhat.com/v1alpha1/namespaces/ns/releases/rel-1",
+            timeout=30,
+        )
+        mock_resp.raise_for_status.assert_called_once()
+        mock_resp.json.assert_not_called()
+        assert result is None
+
+    def test_delete_raises_on_http_error(self, api):
+        mock_resp = MagicMock()
+        mock_resp.raise_for_status.side_effect = requests.HTTPError("403 Forbidden")
+        api._mock_session.delete.return_value = mock_resp
+
+        with pytest.raises(requests.HTTPError):
+            api.delete("/apis/tekton.dev/v1/namespaces/ns/pipelineruns/pr-1")

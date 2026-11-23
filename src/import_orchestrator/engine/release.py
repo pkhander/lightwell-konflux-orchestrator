@@ -59,6 +59,14 @@ class ReleaseMonitor:
         self.prefix = prefix
         self.skip_release = view.skip_release
         self.release_plan = release_plan
+        # Requests reconcile could not read this run. Creating a Release for one of
+        # them uses the filtered finder, which hides a terminally failed Release and
+        # would mint a replacement in the same Attempt.
+        self._skipped: set[int] = set()
+
+    def skip_requests(self, request_ids: set[int]) -> None:
+        """Leave these Requests untouched this run (their reconcile failed)."""
+        self._skipped = set(request_ids)
 
     def update_statuses(self) -> None:
         """For Requests past a successful intake, drive snapshot -> ITS -> release."""
@@ -67,8 +75,10 @@ class ReleaseMonitor:
         # (ADR-0001). The hash is computed here, where the full Request is in
         # scope, and threaded through to create_release.
         eligible: list[tuple[int, str, str, dict[Phase, AttemptPhase]]] = []
-        for request in self.db.list_requests():
+        for request in self.view.requests():
             assert request.id is not None
+            if request.id in self._skipped:
+                continue
             phases = self.db.latest_phase_map(request.id)
             intake = phases.get(Phase.INTAKE)
             if intake is None or intake.status != PhaseStatus.SUCCESS or intake.attempt_id is None:
@@ -114,7 +124,7 @@ class ReleaseMonitor:
 
             # Step 4: poll the tracked release for completion.
             assert release is not None and release.reference_id is not None
-            self._check_release_completion(attempt_id, release.reference_id, tag)
+            self._check_release_completion(attempt_id, release.reference_id, tag, snapshot.reference_id)
 
     @staticmethod
     def _has_reference(phase: AttemptPhase | None) -> bool:
@@ -285,7 +295,7 @@ class ReleaseMonitor:
         )
         print(f"  Tracking release/{release_name} ({tag})", file=sys.stderr)
 
-    def _check_release_completion(self, attempt_id: int, release_name: str, tag: str) -> None:
+    def _check_release_completion(self, attempt_id: int, release_name: str, tag: str, snapshot_name: str) -> None:
         """Poll release status and advance the release phase to SUCCESS/FAILED."""
         release_status = self.kube.get_release_status(release_name)
         if release_status == "True":
@@ -298,14 +308,23 @@ class ReleaseMonitor:
             )
             print(f"  ✓ Released: {tag} (release/{release_name})", file=sys.stderr)
         elif release_status == "False":
+            detail = self.kube.get_release_failure_detail(release_name)
             self.db.upsert_phase(
                 attempt_id,
                 Phase.RELEASE,
                 PhaseStatus.FAILED,
                 reference_type=ClusterResource.RELEASE,
                 reference_id=release_name,
-                error_message=f"Release {release_name} failed",
+                error_message=detail or f"Release {release_name} failed",
             )
             print(f"  ✗ Release failed: {tag} (release/{release_name})", file=sys.stderr)
+            if detail:
+                print(f"    {detail}", file=sys.stderr)
+            # Link straight to the Release page in the Konflux UI, which nests it under
+            # the Snapshot's application. Best-effort: if the application label can't be
+            # read, the failure is still logged above, just without the clickable link.
+            application = self.kube.get_snapshot_application(snapshot_name)
+            if application:
+                print(f"    {self.kube.release_url(application, release_name)}", file=sys.stderr)
         else:
             print(f"  Waiting for release/{release_name} ({tag})...", file=sys.stderr)

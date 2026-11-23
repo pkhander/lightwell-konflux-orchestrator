@@ -90,7 +90,9 @@ spec:
       description: Target directories in component's source code to scan with SAST tools. Multiple values should be separated with commas.
       name: sast-target-dirs
       type: string
-    - default: []
+    - default:
+      - PIPELINE_GIT_URL={{source_url}}
+      - PIPELINE_GIT_REVISION={{revision}}
       description: Array of --build-arg values ("arg=value" strings) for buildah
       name: build-args
       type: array
@@ -308,6 +310,28 @@ spec:
           value: deprecated-image-check
         - name: bundle
           value: quay.io/konflux-ci/tekton-catalog/task-deprecated-image-check:0.5@sha256:81b7cad8d5fd0148b157d622f4064f57d38aa33c142275050c8a4727d1e2144c
+        - name: kind
+          value: task
+        resolver: bundles
+      when:
+      - input: $(params.skip-checks)
+        operator: in
+        values:
+        - "false"
+    - name: clair-scan
+      params:
+      - name: image-digest
+        value: $(tasks.build-image-index.results.IMAGE_DIGEST)
+      - name: image-url
+        value: $(tasks.build-image-index.results.IMAGE_URL)
+      runAfter:
+      - build-image-index
+      taskRef:
+        params:
+        - name: name
+          value: clair-scan
+        - name: bundle
+          value: quay.io/konflux-ci/tekton-catalog/task-clair-scan:0.4.1@sha256:3f5dd00579c8a7dee230d1adb4322e52c8c778ec453cfdbe70507a35310c47c2
         - name: kind
           value: task
         resolver: bundles

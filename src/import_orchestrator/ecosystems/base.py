@@ -56,17 +56,18 @@ def build_request_identity(
     target: str,
     artifact: str,
     release_plan: str = "",
+    source_repo: str = "",
 ) -> dict[str, str]:
     """Assemble the ADR-0001 Request fingerprint from its resolved fields.
 
-    The fingerprint *rule* -- which seven fields identify a Request and how they
+    The fingerprint *rule* -- which fields identify a Request and how they
     are normalized (``pipeline`` stripped of its trailing ``-``, ``release_plan``
     coerced to an empty string when unknown) -- is the same for every ecosystem;
     only the field *values* are ecosystem-specific. Centralized here so ecosystems
     supply values, not rules. The returned dict is passed straight to
     ``WorkflowDatabase.get_or_create_request``.
     """
-    return {
+    identity = {
         "namespace": namespace,
         "application": application,
         "component": component,
@@ -75,6 +76,9 @@ def build_request_identity(
         "target": target,
         "artifact": artifact,
     }
+    if source_repo:
+        identity["source_repo"] = source_repo
+    return identity
 
 
 @runtime_checkable
@@ -98,9 +102,10 @@ class Ecosystem(Protocol):
     def request_identity(self, ref: str, args: argparse.Namespace) -> dict[str, str]:
         """Return the identifying fields of the Request for a ref (ADR-0001).
 
-        Maps a ref plus the invocation args to the seven fingerprint fields a
+        Maps a ref plus the invocation args to the fingerprint fields a
         ``Request`` is created from: ``namespace``, ``application``, ``component``,
-        ``pipeline``, ``release_plan``, ``target`` and ``artifact``. Fields not
+        ``pipeline``, ``release_plan``, ``target`` and ``artifact``, plus an optional
+        ``source_repo`` to distinguish source repositories. Fields not
         known at ingest (notably ``release_plan`` for ecosystems that discover the
         ReleasePlan from the snapshot) are returned as the empty string. This is
         the precursor to the ADR "recipes"; the returned dict is passed straight

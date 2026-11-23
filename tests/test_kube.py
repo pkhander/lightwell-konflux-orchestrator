@@ -23,6 +23,7 @@ import requests
 from import_orchestrator.clients import KubeClient
 from import_orchestrator.clients.kube_api import KubeAuth
 from import_orchestrator.engine.errors import ReleaseError, TriggerError
+from import_orchestrator.models import PruneOutcome
 
 
 def _make_kube_client(monkeypatch, token=None, kubearchive_api=""):
@@ -398,6 +399,105 @@ class TestCountRunningImports:
         assert kube.count_running_imports("pnc-import-") == 2
 
 
+class TestFindIntakePipelinerunsByFingerprint:
+    _LABEL = "custom.appstudio.openshift.io/lightwell-fingerprint"
+
+    def _pr(self, name, *, status="True", created="2026-01-01T00:00:00Z"):
+        meta = {"name": name, "creationTimestamp": created}
+        return {
+            "metadata": meta,
+            "status": {"conditions": [{"type": "Succeeded", "status": status}]},
+        }
+
+    def test_queries_with_fingerprint_and_build_type_selector(self, kube: KubeClient):
+        kube._mock_api.list.return_value = {"items": [self._pr("pnc-import-a")]}
+
+        kube.find_intake_pipelinerun_statuses_by_fingerprint("fp-abc")
+
+        kube._mock_api.list.assert_called_once_with(
+            "/apis/tekton.dev/v1/namespaces/test-ns/pipelineruns",
+            labelSelector=f"{self._LABEL}=fp-abc,pipelines.appstudio.openshift.io/type=build",
+        )
+
+    def test_returns_statuses_oldest_first(self, kube: KubeClient):
+        kube._mock_api.list.return_value = {
+            "items": [
+                self._pr("pr-new", status="Unknown", created="2026-03-01T00:00:00Z"),
+                self._pr("pr-old", status="True", created="2026-01-01T00:00:00Z"),
+                self._pr("pr-mid", status="False", created="2026-02-01T00:00:00Z"),
+            ]
+        }
+
+        result = kube.find_intake_pipelinerun_statuses_by_fingerprint("fp-abc")
+
+        assert [pr.name for pr in result] == ["pr-old", "pr-mid", "pr-new"]
+        assert [pr.status for pr in result] == ["True", "False", "Unknown"]
+
+    def test_pipelinerun_without_condition_is_running_not_dropped(self, kube: KubeClient):
+        """A just-created intake has no Succeeded condition yet; it must be reported RUNNING
+        so the caller does not re-trigger it and create a duplicate."""
+        kube._mock_api.list.return_value = {
+            "items": [{"metadata": {"name": "pr-fresh", "creationTimestamp": "2026-01-01T00:00:00Z"}, "status": {}}]
+        }
+
+        result = kube.find_intake_pipelinerun_statuses_by_fingerprint("fp-abc")
+
+        assert len(result) == 1
+        assert result[0].name == "pr-fresh"
+        assert result[0].is_running is True
+
+    def test_skips_unnamed_items(self, kube: KubeClient):
+        kube._mock_api.list.return_value = {"items": [{"metadata": {}, "status": {}}]}
+
+        assert kube.find_intake_pipelinerun_statuses_by_fingerprint("fp-abc") == []
+
+    def test_raises_on_live_error_so_caller_can_tell_failure_from_empty(self, kube: KubeClient):
+        """A failed live list must NOT look like "no PipelineRuns": the caller has to be
+        able to skip the Request rather than treat it as pending and create a duplicate."""
+        kube._mock_api.list.side_effect = requests.HTTPError("500")
+
+        with pytest.raises(requests.HTTPError):
+            kube.find_intake_pipelinerun_statuses_by_fingerprint("fp-abc")
+
+    def test_falls_back_to_kubearchive_when_live_empty(self, kube_with_ka: KubeClient):
+        kube_with_ka._mock_api.list.return_value = {"items": []}
+        kube_with_ka._mock_ka_api.list.return_value = {"items": [self._pr("pr-archived")]}
+
+        result = kube_with_ka.find_intake_pipelinerun_statuses_by_fingerprint("fp-abc")
+
+        assert [pr.name for pr in result] == ["pr-archived"]
+
+    def test_merges_live_and_archived_deduplicating_by_name(self, kube_with_ka: KubeClient):
+        """History spanning the prune boundary: a live attempt plus older archived ones,
+        with the overlap counted once (live copy preferred)."""
+        kube_with_ka._mock_api.list.return_value = {
+            "items": [
+                self._pr("pr-live", status="Unknown", created="2026-03-01T00:00:00Z"),
+                self._pr("pr-overlap", status="True", created="2026-02-01T00:00:00Z"),
+            ]
+        }
+        kube_with_ka._mock_ka_api.list.return_value = {
+            "items": [
+                self._pr("pr-overlap", status="True", created="2026-02-01T00:00:00Z"),
+                self._pr("pr-archived", status="False", created="2026-01-01T00:00:00Z"),
+            ]
+        }
+
+        result = kube_with_ka.find_intake_pipelinerun_statuses_by_fingerprint("fp-abc")
+
+        assert [pr.name for pr in result] == ["pr-archived", "pr-overlap", "pr-live"]
+
+    def test_live_error_raises_even_when_kubearchive_has_results(self, kube_with_ka: KubeClient):
+        """KubeArchive holds only pruned history; the in-flight intake is on the live API.
+        A live-list failure must raise (not be masked by archived results), or the caller
+        could adopt a stale archived PipelineRun and miss -- then duplicate -- the live one."""
+        kube_with_ka._mock_api.list.side_effect = requests.HTTPError("503")
+        kube_with_ka._mock_ka_api.list.return_value = {"items": [self._pr("pr-archived")]}
+
+        with pytest.raises(requests.HTTPError):
+            kube_with_ka.find_intake_pipelinerun_statuses_by_fingerprint("fp-abc")
+
+
 class TestFindSnapshotByPipelinerun:
     def test_returns_snapshot_name(self, kube: KubeClient):
         kube._mock_api.list.return_value = {"items": [{"metadata": {"name": "snap-abc"}}]}
@@ -418,6 +518,12 @@ class TestFindSnapshotByPipelinerun:
         kube._mock_api.list.side_effect = requests.HTTPError("404")
 
         assert kube.find_snapshot_by_pipelinerun("pr-1") is None
+
+    def test_raise_on_error_propagates_http_error(self, kube: KubeClient):
+        kube._mock_api.list.side_effect = requests.HTTPError("503")
+
+        with pytest.raises(requests.HTTPError):
+            kube.find_snapshot_by_pipelinerun("pr-1", raise_on_error=True)
 
 
 class TestFindReleaseForSnapshot:
@@ -592,6 +698,70 @@ class TestFindReleaseForSnapshotAndPlan:
         assert kube.find_release_for_snapshot_and_plan("snap-1", "remediated-build-prod") == "rel-new"
 
 
+class TestListReleasesForSnapshotAndPlan:
+    def _rel(self, name, *, created, status="False", reason="Failed", plan="remediated-build-prod", snapshot="snap-1"):
+        return {
+            "metadata": {"name": name, "creationTimestamp": created},
+            "spec": {"snapshot": snapshot, "releasePlan": plan},
+            "status": {"conditions": [{"type": "Released", "status": status, "reason": reason}]},
+        }
+
+    def test_returns_all_releases_including_terminal_newest_first(self, kube: KubeClient):
+        """Unlike the finder, this keeps terminally-failed Releases so reconcile can count
+        retries; newest first so the caller's newest Release decides the latest attempt."""
+        kube._mock_api.list.return_value = {
+            "items": [
+                self._rel("rel-1", created="2026-01-01T00:00:00Z", status="False"),
+                self._rel("rel-3", created="2026-03-01T00:00:00Z", status="True", reason="Succeeded"),
+                self._rel("rel-2", created="2026-02-01T00:00:00Z", status="False"),
+            ]
+        }
+
+        result = kube.list_releases_for_snapshot_and_plan("snap-1", "remediated-build-prod")
+
+        assert result == [("rel-3", "True"), ("rel-2", "False"), ("rel-1", "False")]
+
+    def test_scopes_to_snapshot_and_plan(self, kube: KubeClient):
+        kube._mock_api.list.return_value = {
+            "items": [
+                self._rel("rel-other-snap", created="2026-01-01T00:00:00Z", snapshot="snap-2"),
+                self._rel("rel-other-plan", created="2026-01-01T00:00:00Z", plan="some-other-plan"),
+                self._rel("rel-match", created="2026-01-01T00:00:00Z"),
+            ]
+        }
+
+        result = kube.list_releases_for_snapshot_and_plan("snap-1", "remediated-build-prod")
+
+        assert [name for name, _ in result] == ["rel-match"]
+
+    def test_unscoped_matches_any_plan(self, kube: KubeClient):
+        kube._mock_api.list.return_value = {
+            "items": [
+                self._rel("rel-a", created="2026-02-01T00:00:00Z", plan="plan-a"),
+                self._rel("rel-b", created="2026-01-01T00:00:00Z", plan="plan-b"),
+            ]
+        }
+
+        result = kube.list_releases_for_snapshot_and_plan("snap-1", None)
+
+        assert [name for name, _ in result] == ["rel-a", "rel-b"]
+
+    def test_progressing_release_reads_as_unknown(self, kube: KubeClient):
+        kube._mock_api.list.return_value = {
+            "items": [self._rel("rel-prog", created="2026-01-01T00:00:00Z", status="False", reason="Progressing")]
+        }
+
+        assert kube.list_releases_for_snapshot_and_plan("snap-1", "remediated-build-prod") == [("rel-prog", "Unknown")]
+
+    def test_raises_on_list_error(self, kube: KubeClient):
+        """A failed list must raise so reconcile can skip the Request rather than
+        undercount the retry budget."""
+        kube._mock_api.list.side_effect = requests.HTTPError("503")
+
+        with pytest.raises(requests.HTTPError):
+            kube.list_releases_for_snapshot_and_plan("snap-1", "remediated-build-prod")
+
+
 class TestGetReleaseStatus:
     def test_returns_true_on_success(self, kube: KubeClient):
         kube._mock_api.get.return_value = {
@@ -623,6 +793,70 @@ class TestGetReleaseStatus:
         kube._mock_api.get.side_effect = requests.HTTPError("404")
 
         assert kube.get_release_status("rel-1") is None
+
+
+class TestGetReleaseFailureDetail:
+    def test_joins_reason_and_message(self, kube: KubeClient):
+        kube._mock_api.get.return_value = {
+            "status": {
+                "conditions": [
+                    {"type": "Released", "status": "False", "reason": "Failed", "message": "managed pipeline failed"}
+                ]
+            }
+        }
+
+        assert kube.get_release_failure_detail("rel-1") == "Failed - managed pipeline failed"
+
+    def test_uses_reason_alone_when_no_message(self, kube: KubeClient):
+        kube._mock_api.get.return_value = {
+            "status": {"conditions": [{"type": "Released", "status": "False", "reason": "Failed"}]}
+        }
+
+        assert kube.get_release_failure_detail("rel-1") == "Failed"
+
+    def test_returns_none_when_no_released_condition(self, kube: KubeClient):
+        kube._mock_api.get.return_value = {"status": {"conditions": [{"type": "Other", "status": "False"}]}}
+
+        assert kube.get_release_failure_detail("rel-1") is None
+
+    def test_returns_none_when_reason_and_message_empty(self, kube: KubeClient):
+        kube._mock_api.get.return_value = {"status": {"conditions": [{"type": "Released", "status": "False"}]}}
+
+        assert kube.get_release_failure_detail("rel-1") is None
+
+    def test_returns_none_when_release_cannot_be_read(self, kube: KubeClient):
+        kube._mock_api.get.side_effect = requests.HTTPError("404")
+
+        assert kube.get_release_failure_detail("rel-1") is None
+
+
+class TestGetSnapshotApplication:
+    def test_returns_application_label(self, kube: KubeClient):
+        kube._mock_api.get.return_value = {
+            "metadata": {"labels": {"appstudio.openshift.io/application": "python-sdist-mirror"}}
+        }
+
+        assert kube.get_snapshot_application("snap-1") == "python-sdist-mirror"
+
+    def test_returns_none_when_label_absent(self, kube: KubeClient):
+        kube._mock_api.get.return_value = {"metadata": {"labels": {"other": "x"}}}
+
+        assert kube.get_snapshot_application("snap-1") is None
+
+    def test_returns_none_when_snapshot_cannot_be_read(self, kube: KubeClient):
+        kube._mock_api.get.side_effect = requests.HTTPError("404")
+
+        assert kube.get_snapshot_application("snap-1") is None
+
+
+class TestReleaseUrl:
+    def test_builds_konflux_ui_url(self, kube: KubeClient):
+        url = kube.release_url("python-sdist-mirror", "rel-1")
+
+        assert url == (
+            "https://konflux-ui.apps.stone-prod-p01.wcfb.p1.openshiftapps.com/ns"
+            "/test-ns/applications/python-sdist-mirror/releases/rel-1"
+        )
 
 
 class TestGetSnapshotTestStatus:
@@ -958,3 +1192,67 @@ class TestCreateRelease:
 
         api_path = kube._mock_api.create.call_args[0][0]
         assert "/namespaces/test-ns/" in api_path
+
+
+def _http_error(status_code: int) -> requests.HTTPError:
+    response = requests.Response()
+    response.status_code = status_code
+    return requests.HTTPError(f"{status_code} error", response=response)
+
+
+class TestDeleteRequestResources:
+    def test_deletes_releases_and_snapshots_by_name(self, kube: KubeClient):
+        kube._mock_api.delete.return_value = {"kind": "Status", "status": "Success"}
+
+        outcome = kube.delete_request_resources(releases=["rel-2", "rel-1"], snapshots=["snap-1"])
+        assert outcome is PruneOutcome.DELETED
+
+        paths = [call.args[0] for call in kube._mock_api.delete.call_args_list]
+        # Names are deduped and sorted; releases before snapshots.
+        assert paths == [
+            "/apis/appstudio.redhat.com/v1alpha1/namespaces/test-ns/releases/rel-1",
+            "/apis/appstudio.redhat.com/v1alpha1/namespaces/test-ns/releases/rel-2",
+            "/apis/appstudio.redhat.com/v1alpha1/namespaces/test-ns/snapshots/snap-1",
+        ]
+
+    def test_dedupes_repeated_names(self, kube: KubeClient):
+        kube._mock_api.delete.return_value = {"kind": "Status"}
+
+        assert kube.delete_request_resources(snapshots=["snap-1", "snap-1"]) is PruneOutcome.DELETED
+        assert kube._mock_api.delete.call_count == 1
+
+    def test_no_targets_is_deleted_without_api_calls(self, kube: KubeClient):
+        assert kube.delete_request_resources() is PruneOutcome.DELETED
+        kube._mock_api.delete.assert_not_called()
+
+    def test_404_is_treated_as_deleted(self, kube: KubeClient):
+        kube._mock_api.delete.side_effect = _http_error(404)
+
+        assert kube.delete_request_resources(releases=["rel-1"], snapshots=["snap-1"]) is PruneOutcome.DELETED
+
+    def test_403_returns_forbidden(self, kube: KubeClient, capsys):
+        kube._mock_api.delete.side_effect = _http_error(403)
+
+        assert kube.delete_request_resources(releases=["rel-1"]) is PruneOutcome.FORBIDDEN
+        assert "prune Release rel-1" in capsys.readouterr().err
+
+    def test_transient_error_returns_retry_but_attempts_all(self, kube: KubeClient):
+        def side_effect(api_path):
+            if api_path.endswith("/snapshots/snap-1"):
+                raise _http_error(500)
+            return {"kind": "Status"}
+
+        kube._mock_api.delete.side_effect = side_effect
+
+        assert kube.delete_request_resources(releases=["rel-1"], snapshots=["snap-1"]) is PruneOutcome.RETRY
+        assert kube._mock_api.delete.call_count == 2  # both attempted despite the middle failure
+
+    def test_forbidden_takes_precedence_over_retry(self, kube: KubeClient):
+        def side_effect(api_path):
+            if api_path.endswith("/releases/rel-1"):
+                raise _http_error(500)  # transient
+            raise _http_error(403)  # forbidden
+
+        kube._mock_api.delete.side_effect = side_effect
+
+        assert kube.delete_request_resources(releases=["rel-1"], snapshots=["snap-1"]) is PruneOutcome.FORBIDDEN

@@ -22,6 +22,7 @@ import os
 from import_orchestrator.commands.orchestrate import add_common_orchestrate_args, run_orchestrate
 from import_orchestrator.ecosystems.base import Ecosystem
 from import_orchestrator.ecosystems.python import config
+from import_orchestrator.ecosystems.python.commands.build_args import add_build_repo_args
 
 _EMPTY_DB_WARNING = "No package references in database. Run 'import-orchestrator python import-file' first."
 
@@ -35,6 +36,7 @@ def register(subparsers: argparse._SubParsersAction, ecosystem: Ecosystem) -> No
     )
 
     add_common_orchestrate_args(parser)
+    add_build_repo_args(parser)
 
     parser.add_argument(
         "--target",

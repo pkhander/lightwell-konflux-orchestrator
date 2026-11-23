@@ -31,6 +31,8 @@ from import_orchestrator.engine import (
     ImportTrigger,
     Ingest,
     PipelineMonitor,
+    PruneMonitor,
+    Reconciler,
     ReleaseMonitor,
     RequestView,
 )
@@ -136,10 +138,16 @@ def run_single(args: argparse.Namespace, ref: str) -> int:
             target = getattr(args, "target", None)
             skip_release = target is not None and getattr(eco, "target_skip_release", lambda t: False)(target)
 
-            Ingest(db, build_identity=lambda r: eco.request_identity(r, args)).from_lines([ref])
+            identity = eco.request_identity(ref, args)
+            Ingest(db, build_identity=lambda r: identity).from_lines([ref])
+            request, _ = db.get_or_create_request(**identity)
+            if request.id is None:
+                raise RuntimeError("get_or_create_request returned a Request without an id")
 
             kube = KubeClient(eco.namespace, CLUSTER_API, KUBEARCHIVE_API)
-            view = RequestView(db, skip_release)
+            # One ref, even when --db is the shared ecosystem database. Reconciling
+            # every row would apply this run's skip_release to other targets.
+            view = RequestView(db, skip_release, request_ids={request.id})
 
             trigger = ImportTrigger(
                 view=view,
@@ -156,6 +164,7 @@ def run_single(args: argparse.Namespace, ref: str) -> int:
                 prefix=eco.pipelinerun_prefix,
                 release_plan=getattr(args, "release_plan", None),
             )
+            reconciler = Reconciler(view=view, kube=kube, release_plan=getattr(args, "release_plan", None))
 
             orchestrator = ImportOrchestrator(
                 view=view,
@@ -164,12 +173,13 @@ def run_single(args: argparse.Namespace, ref: str) -> int:
                 release_monitor=release_monitor,
                 poll_interval=args.poll_interval,
                 max_retries=args.max_retries,
+                prune_monitor=PruneMonitor(view=view, kube=kube, max_retries=args.max_retries),
+                reconciler=reconciler,
             )
 
             rc = orchestrator.run_until_complete()
 
             # Capture final state while the DB is still open, before cleanup.
-            request = next((r for r in db.list_requests() if r.artifact == ref), None)
             payload = _result_payload(ref, view, request, rc)
             _emit_result(payload, getattr(args, "output_json", None))
 

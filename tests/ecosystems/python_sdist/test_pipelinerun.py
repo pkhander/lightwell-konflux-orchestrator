@@ -104,3 +104,40 @@ class TestBuildManifest:
     def test_rejects_partial_pipeline_source_identity(self):
         with pytest.raises(TriggerError):
             _manifest(pipeline_git_url="https://github.com/konflux-lightwell/lightwell-konflux-orchestrator")
+
+
+def test_build_pipelinerun_manifest_for_git_source():
+    manifest = build_pipelinerun_manifest(
+        package="griffe",
+        version="2.3.2",
+        pipeline_spec={"tasks": []},
+        namespace="lightwell-python-tenant",
+        application="python-sdist-mirror",
+        component="python-sdist-mirror",
+        prefix="python-git-ingest-",
+        image_repo_base="quay.io/redhat-user-workloads/lightwell-python-tenant",
+        source_type="git",
+        upstream_url="https://github.com/mkdocstrings/griffe",
+        upstream_ref="2.3.2",
+    )
+    params = {p["name"]: p["value"] for p in manifest["spec"]["params"]}
+    assert params["UPSTREAM_URL"] == "https://github.com/mkdocstrings/griffe"
+    assert params["UPSTREAM_REF"] == "2.3.2"
+    assert params["SOURCE_TYPE"] == "git"
+    assert "SOURCE_REGISTRIES" not in params
+
+
+def test_build_pipelinerun_manifest_for_git_source_requires_upstream_url_and_ref():
+    with pytest.raises(TriggerError):
+        build_pipelinerun_manifest(
+            package="griffe",
+            version="2.3.2",
+            pipeline_spec={"tasks": []},
+            namespace="lightwell-python-tenant",
+            application="python-sdist-mirror",
+            component="python-sdist-mirror",
+            prefix="python-git-ingest-",
+            image_repo_base="quay.io/redhat-user-workloads/lightwell-python-tenant",
+            source_type="git",
+            upstream_url="https://github.com/mkdocstrings/griffe",
+        )

@@ -21,7 +21,7 @@ from unittest.mock import MagicMock, patch
 
 from import_orchestrator.commands.run import run_single
 from import_orchestrator.database import WorkflowDatabase
-from import_orchestrator.engine import ImportOrchestrator, PipelineMonitor
+from import_orchestrator.engine import ImportOrchestrator, PipelineMonitor, PruneMonitor, Reconciler
 from import_orchestrator.models import ClusterResource, Phase, PhaseStatus
 
 _REF = "ntplib==0.4.0"
@@ -109,6 +109,26 @@ def _make_failure(error_message):
     return fake_run
 
 
+class TestPruneWiring:
+    def test_run_wires_prune_monitor(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("tempfile.mkdtemp", lambda *a, **k: str(tmp_path / "eph"))
+        captured: dict = {}
+
+        def fake_run(self):
+            captured["monitor"] = self._prune_monitor
+            return 0
+
+        with (
+            patch("import_orchestrator.commands.run.KubeClient"),
+            patch.object(ImportOrchestrator, "run_until_complete", fake_run),
+        ):
+            assert run_single(_args(), _REF) == 0
+
+        monitor = captured["monitor"]
+        assert isinstance(monitor, PruneMonitor)
+        assert monitor.max_retries == 3
+
+
 class TestEphemeralDatabase:
     def test_seeds_single_ref_then_cleans_up(self, tmp_path, monkeypatch):
         eph_dir = tmp_path / "eph"
@@ -142,6 +162,35 @@ class TestEphemeralDatabase:
 
 
 class TestPersistentDatabase:
+    def test_result_uses_request_for_selected_repository(self, tmp_path, capsys):
+        db_path = tmp_path / "shared.db"
+        eco = _make_eco()
+        eco.request_identity.side_effect = lambda ref, args: {
+            **_identity(ref, args),
+            "source_repo": args.lightwell_builds_repo_url,
+        }
+
+        def complete_selected_request(self):
+            request = self.view.pending()[0]
+            attempt = self.view.db.create_attempt(request.id)
+            self.view.db.upsert_phase(
+                attempt.id, Phase.INTAKE, PhaseStatus.SUCCESS, ClusterResource.PIPELINE_RUN, request.source_repo
+            )
+            self.view.db.upsert_phase(
+                attempt.id, Phase.RELEASE, PhaseStatus.SUCCESS, ClusterResource.RELEASE, "release"
+            )
+            return 0
+
+        for source in ["https://example.com/first.git", "https://example.com/second.git"]:
+            with (
+                patch("import_orchestrator.commands.run.KubeClient"),
+                patch.object(ImportOrchestrator, "run_until_complete", complete_selected_request),
+            ):
+                run_single(_args(ecosystem=eco, db_explicit=True, db=db_path, lightwell_builds_repo_url=source), _REF)
+            payload = json.loads(capsys.readouterr().out)
+            assert payload["pipelinerun_name"] == source
+        assert _request_count(db_path) == 2
+
     def test_explicit_db_seeded_and_retained(self, tmp_path):
         db_path = tmp_path / "ct-123.db"
 
@@ -286,3 +335,22 @@ class TestSkipRelease:
 
     def test_no_target_does_not_skip_release(self, tmp_path, monkeypatch):
         assert self._captured_skip_release(tmp_path, monkeypatch, _args()) is False
+
+    def test_scopes_reconcile_to_the_single_request(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("tempfile.mkdtemp", lambda *a, **k: str(tmp_path / "eph"))
+        captured: dict = {}
+        real_init = Reconciler.__init__
+
+        def capturing_init(self, view, kube, release_plan=None):
+            captured["request_ids"] = view.request_ids
+            real_init(self, view, kube, release_plan=release_plan)
+
+        with (
+            patch("import_orchestrator.commands.run.KubeClient"),
+            patch.object(ImportOrchestrator, "run_until_complete", lambda self: 0),
+            patch.object(Reconciler, "__init__", capturing_init),
+        ):
+            run_single(_args(), _REF)
+
+        assert captured["request_ids"] is not None
+        assert len(captured["request_ids"]) == 1

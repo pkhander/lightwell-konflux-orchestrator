@@ -256,10 +256,35 @@ orchestrator python run <ref> [OPTIONS]
 |-----------------|---------|-------------|
 | `ref` | — | Package reference as `package==version` (e.g. `ntplib==0.4.0`) |
 | `--target` | `REMEDIATED` (or `LIGHTWELL_PYTHON_TARGET` env var) | Build target |
+| `--wheel-server-url` | `https://packages.redhat.com/lightwell/python/validated/simple/` (or `WHEEL_SERVER_URL` env var) | Wheel server for all build types, including Validated; pass `''` to disable |
+| `--python-builder-image` | Pipeline parameter default | Override the Python builder execution image for this invocation |
 | `--builds-tag` / `--builds-ref` | `<package>/<version>` | `lightwell-builds` git revision to build from |
+| `--lightwell-builds-repo-url` | derived from repository base | Exact source Git URL passed as `LIGHTWELL_BUILDS_REPO_URL` |
+| `--lightwell-builds-repo-base` | `https://gitlab.cee.redhat.com/lightwell/lightwell-builds` | Source namespace; appends `/pypi.org-<package>` |
 | `--poll-interval` | `30` | Seconds between status checks |
 | `--max-retries` | `3` | Max retry attempts on transient failure |
 | `--output-json` | — | Also write the result JSON to this path |
+
+The repository URL and base options are mutually exclusive. They and the
+`--builds-tag` / `--builds-ref` aliases are available on `python run`,
+`python trigger`, and `python orchestrate`. An explicit Git revision applies to
+every package in the invocation; otherwise each uses its `<package>/<version>`
+tag. For batch builds, use a repository
+base to select a separate source repository for each package:
+
+```bash
+orchestrator python orchestrate --target VALIDATED-STAGE \
+  --lightwell-builds-repo-base https://gitlab.example.com/lightwell/test-builds
+
+orchestrator python run ntplib==0.4.0 --target VALIDATED-STAGE \
+  --lightwell-builds-repo-url https://gitlab.example.com/lightwell/test-builds/custom-ntplib.git
+```
+
+An exact URL is used unchanged for every package in that invocation. Omitting
+both options retains the production repository base. The resolved source
+repository URL is part of the request identity, so changing repositories creates
+a separate request even when using the same database. Equivalent URL and base
+options that resolve to the same URL reuse the same request.
 
 ##### Database: ephemeral by default
 
@@ -385,6 +410,11 @@ retry. A terminally failed Release is *not* adopted, so a retry after `1` genuin
 | `LIGHTWELL_ARTIFACT_TYPE` | No | `STAGE` (default), `VALIDATED`, `REMEDIATED`, or `NOVEL` |
 | `LIGHTWELL_PYTHON_TARGET` | No | Build target for the `python` ecosystem: `REMEDIATED` (default) |
 | `TEKTON_PIPELINE_DIR` | No | Path to directory containing Tekton pipeline definitions (defaults to `tekton/` in repository root) |
+| `BUILD_CONFIGS_LOCAL_PATH` | No | Path to an already-checked-out build-config repository, for the `python-sdist` ecosystem only (the `python` ecosystem only ever passes `BUILD_CONFIGS_REPO_URL`/`BUILD_CONFIGS_REVISION` through as PipelineRun params — see below — so it has no local-checkout path to take). When set, `resolve_canonical_source` reads directly from this path instead of cloning — the common case, since the orchestrator is usually invoked from within a calunga-python checkout already (e.g. calunga-python's own CI calls `import-orchestrator python-sdist ...` from a job whose working directory **is** the calunga-python checkout). Takes priority over `BUILD_CONFIGS_REPO_URL`/`BUILD_CONFIGS_REVISION` when set; the clone-based path below remains available as a fallback for invocations that don't already have a local checkout (e.g. standalone/local developer use via `orchestrator python-sdist ...`). |
+| `BUILD_CONFIGS_REPO_URL` | **Yes** — for the `python` ecosystem always, and for `python-sdist` unless `BUILD_CONFIGS_LOCAL_PATH` is set | HTTPS URL (no embedded credentials) of the calunga-python build-config repository. Required by both Python ecosystems: `python` passes it straight through as a `BUILD_CONFIGS_REPO_URL` PipelineRun param for its build task to clone itself; `python-sdist` clones it directly at trigger time (unless `BUILD_CONFIGS_LOCAL_PATH` is set) to run `resolve_canonical_source` — needed for every `python-sdist` trigger, not just `canonical_source.type: git` routing, since `build_pipelinerun` unconditionally resolves canonical source before building any PipelineRun manifest. |
+| `BUILD_CONFIGS_REVISION` | No | Git revision (branch or tag) of the build-config repo to clone. Defaults to `main`. Used by both the `python` and `python-sdist` ecosystems the same way `BUILD_CONFIGS_REPO_URL` is (pass-through param vs. trigger-time clone, respectively); ignored for `python-sdist` when `BUILD_CONFIGS_LOCAL_PATH` is set. |
+
+> **`python-sdist` now fails closed on a missing build-config entry.** Every package/version triggered through the `python-sdist` ecosystem must have a matching `packages/<name>.json` entry (with a valid PEP 440 version) in the configured calunga-python repo — if it's missing, or the entry's reported `canonical_source.type` is neither `git` nor `pypi-sdist`, the trigger now fails with `TriggerError` instead of proceeding as plain sdist ingestion, which was the behavior before this resolver existed. When `BUILD_CONFIGS_LOCAL_PATH` is unset (no local checkout available), `git` and network access to the configured `BUILD_CONFIGS_REPO_URL` host are hard runtime prerequisites for the `python-sdist` ecosystem, in addition to `BUILD_CONFIGS_REPO_URL` itself.
 
 
 ### Operation Flow

@@ -116,8 +116,10 @@ class WorkflowDatabase:
                 release_plan TEXT NOT NULL,
                 artifact TEXT NOT NULL,
                 target TEXT NOT NULL,
+                source_repo TEXT NOT NULL DEFAULT '',
                 created_at TIMESTAMP NOT NULL,
-                UNIQUE(namespace, application, component, pipeline, release_plan, target, artifact)
+                pruned_at TIMESTAMP,
+                UNIQUE(namespace, application, component, pipeline, release_plan, target, artifact, source_repo)
             )
         """
         )
@@ -165,11 +167,12 @@ class WorkflowDatabase:
         release_plan: str,
         artifact: str,
         target: str,
+        source_repo: str = "",
     ) -> tuple[Request, bool]:
         """Create a Request for an artifact/target, or return the existing one.
 
-        The seven identifying fields form the request fingerprint (ADR-0001);
-        re-importing the same artifact for the same target is a no-op.
+        The identifying fields include the source repository when supplied;
+        re-importing the same artifact, target and source is a no-op.
 
         Returns:
             Tuple of (Request, was_inserted) where was_inserted is True if newly
@@ -182,10 +185,10 @@ class WorkflowDatabase:
         cursor.execute(
             """
             INSERT OR IGNORE INTO requests
-                (namespace, application, component, pipeline, release_plan, artifact, target, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                (namespace, application, component, pipeline, release_plan, artifact, target, source_repo, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
-            (namespace, application, component, pipeline, release_plan, artifact, target, now),
+            (namespace, application, component, pipeline, release_plan, artifact, target, source_repo, now),
         )
         was_inserted = cursor.rowcount > 0
         self.conn.commit()
@@ -194,9 +197,9 @@ class WorkflowDatabase:
             """
             SELECT * FROM requests
             WHERE namespace = ? AND application = ? AND component = ? AND pipeline = ?
-              AND release_plan = ? AND target = ? AND artifact = ?
+              AND release_plan = ? AND target = ? AND artifact = ? AND source_repo = ?
         """,
-            (namespace, application, component, pipeline, release_plan, target, artifact),
+            (namespace, application, component, pipeline, release_plan, target, artifact, source_repo),
         )
         return self._row_to_request(cursor.fetchone()), was_inserted
 
@@ -214,6 +217,14 @@ class WorkflowDatabase:
         cursor = self.conn.cursor()
         cursor.execute("SELECT * FROM requests ORDER BY id")
         return [self._row_to_request(row) for row in cursor.fetchall()]
+
+    def mark_pruned(self, request_id: int) -> None:
+        """Stamp ``pruned_at`` so the Request's resources are not pruned again."""
+        assert self.conn is not None
+        cursor = self.conn.cursor()
+        now = datetime.now(timezone.utc).isoformat()
+        cursor.execute("UPDATE requests SET pruned_at = ? WHERE id = ?", (now, request_id))
+        self.conn.commit()
 
     # -- Attempts ----------------------------------------------------------
 
@@ -293,6 +304,28 @@ class WorkflowDatabase:
         )
         row = cursor.fetchone()
         return self._row_to_attempt(row) if row else None
+
+    def delete_attempts(self, request_id: int) -> None:
+        """Delete every Attempt (and its phases) for a Request.
+
+        Reconciliation uses this to rebuild a Request's Attempt history from the
+        cluster when the cache and the cluster disagree on Attempt identity, count or
+        order (the cache is disposable; the cluster is the source of truth, ADR-0001).
+        Phases are removed first because the schema's foreign key has no cascade.
+        """
+        if self.conn is None:
+            raise RuntimeError("database connection is not open")
+        cursor = self.conn.cursor()
+        try:
+            cursor.execute(
+                "DELETE FROM attempt_phases WHERE attempt_id IN (SELECT id FROM attempts WHERE request_id = ?)",
+                (request_id,),
+            )
+            cursor.execute("DELETE FROM attempts WHERE request_id = ?", (request_id,))
+            self.conn.commit()
+        except Exception:
+            self.conn.rollback()
+            raise
 
     # -- Attempt phases ----------------------------------------------------
 
@@ -447,7 +480,9 @@ class WorkflowDatabase:
             release_plan=row["release_plan"],
             artifact=row["artifact"],
             target=row["target"],
+            source_repo=row["source_repo"],
             created_at=self._parse_timestamp(row["created_at"]),
+            pruned_at=self._parse_timestamp(row["pruned_at"]),
         )
 
     def _row_to_attempt(self, row: sqlite3.Row) -> Attempt:

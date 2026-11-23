@@ -131,7 +131,11 @@ class Fingerprint:
     release_plan: str
     target: str
     artifact: str
+    source_repo: str = ""
 ```
+
+For Python wheel builds, `source_repo` is the resolved source repository URL
+used by the PipelineRun. Other ecosystems leave it empty.
 
 If a new request is made with a fingerprint that already exists in the cluster, the orchestrator will then try to
 reconcile the cache and resume the process.

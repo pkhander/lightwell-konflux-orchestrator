@@ -19,8 +19,8 @@ spec:
 
     Validated:
       Builds a straight upstream rebuild. No version suffix is applied — the
-      wheel ships with the upstream version as-is. No prebuilt wheel server is
-      used; dependencies are resolved from upstream sources.
+      wheel ships with the upstream version as-is. An optional prebuilt wheel
+      server can be used for dependency resolution.
 
     Pipeline flow:
       1. git-clone-oci-ta: Clone pypi.org-<package> from lightwell-builds at the
@@ -53,7 +53,7 @@ spec:
         Build mode. Accepted values:
           Backport — remediated build, B/N from commits since ingestion tag.
           Novel    — remediated build, B from ingestion→baseline, N from baseline→HEAD.
-          Validated — upstream rebuild; no version suffix, no wheel server.
+          Validated — upstream rebuild; no version suffix, optional wheel server.
       type: string
     - name: BUILD_CONFIGS_REPO_URL
       description: Build-config registry URL, supplied by the orchestrator.
@@ -65,12 +65,12 @@ spec:
     - name: PYTHON_BUILDER_IMAGE
       description: Digest-pinned python-builder image containing the Lightwell task CLIs.
       type: string
-      default: quay.io/light-factory/python-builder-cli@sha256:23bf3413ec20a00b0a09c4aac0435b9c05f92994e66557b58b1de1e09bf5508c
+      default: quay.io/light-factory/python-builder-cli@sha256:1f3ad55356ecbcba950d67b6b0ec312c8c84cfb135309343bed0d6af02192c01
 
     - name: FATH_CUAN_IMAGE
       description: Digest-pinned fath-cuan image.
       type: string
-      default: quay.io/light-factory/fath-cuan@sha256:254f36f2a84c33df1cbd5715826f8d8bdfed23a4993a3bb8677c439cf40fcd6b
+      default: quay.io/light-factory/fath-cuan:latest@sha256:439c6178225f5435f53e8db8a73c86ef37806ef28b35a8baa604e63956581b28
 
     - name: LIGHTWELL_BUILDS_REPO_URL
       description: >-
@@ -203,7 +203,7 @@ spec:
         resolver: bundles
         params:
           - name: bundle
-            value: quay.io/light-factory/tekton-catalog/task-source-to-sdist@sha256:4cc15c186c4a6bc943f1efbaba11882a5e042ec9c8656c5a64a0b98ae2aa7299
+            value: quay.io/light-factory/tekton-catalog/task-source-to-sdist:0.2@sha256:4cc15c186c4a6bc943f1efbaba11882a5e042ec9c8656c5a64a0b98ae2aa7299
           - name: name
             value: source-to-sdist
           - name: kind
@@ -245,7 +245,7 @@ spec:
         resolver: bundles
         params:
           - name: bundle
-            value: quay.io/light-factory/tekton-catalog/task-fromager-build-wheels@sha256:c1f4cf1af93f159e3712e7c39fe0288bc1444fbc279367562d8919896de963f1
+            value: quay.io/light-factory/tekton-catalog/task-fromager-build-wheels:0.2@sha256:b1ddc69008f24c5795db5a822e0f0e42b238a47ec351a56acfde02d4b98d408d
           - name: name
             value: python-fromager-build-wheels
           - name: kind
@@ -301,11 +301,18 @@ spec:
 
     # ── Step 5: Attach the fath-cuan build index to the wheels image ─────────
     - name: attach-build-index
+      # Scratch is a reversioning check that never releases, so it needs no
+      # vuln build-index; skip the task (and its release-side BUILD_INDEX_*
+      # results) for Scratch. Backport/Novel/Validated are unaffected.
+      when:
+        - input: "$(params.BUILD_TYPE)"
+          operator: notin
+          values: ["Scratch"]
       taskRef:
         resolver: bundles
         params:
           - name: bundle
-            value: quay.io/light-factory/tekton-catalog/task-attach-build-index@sha256:b0cea6fb79a6e4375efb8b3c4980fd2f0157b0fb7ba0ac21d1a7b68d94d6b501
+            value: quay.io/light-factory/tekton-catalog/task-attach-build-index:0.2@sha256:b0cea6fb79a6e4375efb8b3c4980fd2f0157b0fb7ba0ac21d1a7b68d94d6b501
           - name: name
             value: attach-build-index
           - name: kind

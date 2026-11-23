@@ -23,6 +23,7 @@ from import_orchestrator.commands.run import run_single
 from import_orchestrator.constants import DEFAULT_MAX_RETRIES, DEFAULT_POLL_INTERVAL
 from import_orchestrator.ecosystems.base import Ecosystem
 from import_orchestrator.ecosystems.python import config
+from import_orchestrator.ecosystems.python.commands.build_args import add_build_repo_args
 
 
 def register(subparsers: argparse._SubParsersAction, ecosystem: Ecosystem) -> None:
@@ -62,20 +63,6 @@ def register(subparsers: argparse._SubParsersAction, ecosystem: Ecosystem) -> No
         ),
     )
     parser.add_argument(
-        "--builds-tag",
-        "--builds-ref",
-        dest="builds_tag",
-        default=None,
-        help=(
-            "Git revision -- branch, tag, or commit SHA -- in the lightwell-builds "
-            "repo to build from (--builds-ref is a synonym). When omitted, defaults "
-            "to the '<package>/<version>' tag derived from the ref argument -- by "
-            "convention the tag the validated build publishes. The revision's "
-            "existence is not checked here; a missing one fails later when the "
-            "pipeline clones it."
-        ),
-    )
-    parser.add_argument(
         "--release-plan",
         default=None,
         metavar="NAME",
@@ -103,6 +90,7 @@ def register(subparsers: argparse._SubParsersAction, ecosystem: Ecosystem) -> No
         help="Also write the final result payload as JSON to PATH (in addition to stdout)",
     )
 
+    add_build_repo_args(parser)
     parser.set_defaults(func=run, ecosystem=ecosystem)
 
 

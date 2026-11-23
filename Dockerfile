@@ -18,6 +18,14 @@ FROM registry.access.redhat.com/ubi9/python-312-minimal@sha256:b99faaadaf10de740
 
 WORKDIR /opt/import-orchestrator
 
+# git is required at runtime by the python-sdist ecosystem's canonical-source
+# resolver (import_orchestrator.ecosystems.python_sdist.canonical_source), which
+# shallow-clones the calunga-python build-config repo for every trigger.
+USER 0
+RUN microdnf install -y git-core \
+ && microdnf clean all
+USER 1001
+
 COPY --from=builder /build/dist/*.whl /tmp/
 
 RUN pip install --no-cache-dir /tmp/*.whl \

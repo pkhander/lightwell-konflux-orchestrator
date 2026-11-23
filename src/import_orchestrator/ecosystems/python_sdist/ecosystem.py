@@ -20,6 +20,7 @@ import argparse
 
 from import_orchestrator.ecosystems.base import build_request_identity
 from import_orchestrator.ecosystems.python_sdist import config
+from import_orchestrator.ecosystems.python_sdist.canonical_source import resolve_canonical_source
 from import_orchestrator.ecosystems.python_sdist.pipelinerun import build_pipelinerun_manifest, parse_ref
 from import_orchestrator.engine.pipeline_loader import load_pipeline
 
@@ -36,22 +37,38 @@ class PythonSdistEcosystem:
         package, version = parse_ref(ref)
         target = getattr(args, "target", config.DEFAULT_TARGET)
         cfg = config.TARGET_CONFIGS[target]
+        pipeline_git_url, pipeline_revision = config.pipeline_source_identity()
+        source = resolve_canonical_source(package, version)
+
+        common_kwargs = {
+            "package": package,
+            "version": version,
+            "namespace": self.namespace,
+            "application": cfg["app"],
+            "component": cfg["component"],
+            "service_account": cfg["service_account"],
+            "prefix": self.pipelinerun_prefix,
+            "image_repo_base": config.IMAGE_REPO_BASE,
+            "pipeline_git_url": pipeline_git_url,
+            "pipeline_revision": pipeline_revision,
+        }
+
+        if source["type"] == "git":
+            pipeline_spec = load_pipeline(config.git_pipeline_definition_path())
+            return build_pipelinerun_manifest(
+                **common_kwargs,
+                pipeline_spec=pipeline_spec,
+                source_type="git",
+                upstream_url=source["upstream_url"],
+                upstream_ref=source["ref"],
+            )
+
         source_registries = getattr(args, "source_registries", "rhtl")
         pipeline_spec = load_pipeline(config.pipeline_definition_path())
-        pipeline_git_url, pipeline_revision = config.pipeline_source_identity()
         return build_pipelinerun_manifest(
-            package=package,
-            version=version,
+            **common_kwargs,
             pipeline_spec=pipeline_spec,
-            namespace=self.namespace,
-            application=cfg["app"],
-            component=cfg["component"],
-            service_account=cfg["service_account"],
-            prefix=self.pipelinerun_prefix,
-            image_repo_base=config.IMAGE_REPO_BASE,
             source_registries=source_registries,
-            pipeline_git_url=pipeline_git_url,
-            pipeline_revision=pipeline_revision,
         )
 
     def request_identity(self, ref: str, args: argparse.Namespace) -> dict[str, str]:

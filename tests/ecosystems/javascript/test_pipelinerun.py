@@ -123,7 +123,7 @@ class TestBuildManifest:
         assert params["output-image"] == expected_image
         assert params["builder-image"].startswith("quay.io/example/npm-builder")
         assert params["tl-npm-registry-url"] == (
-            "https://packages.redhat.com/api/pulp-content/lightwell-stage/javascript/validated"
+            "https://packages.redhat.com/api/pulp-content/lightwell/javascript/validated"
         )
         assert params["pulp-read-secret-name"] == "lightwell-pulp-read-secret"
 

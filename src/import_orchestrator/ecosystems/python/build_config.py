@@ -27,3 +27,17 @@ def get_build_config_source() -> str:
     if parsed.scheme != "https" or not parsed.netloc or parsed.username or parsed.password:
         raise TriggerError("BUILD_CONFIGS_REPO_URL must be an HTTPS URL without embedded credentials")
     return repo_url
+
+
+def get_build_config_local_path() -> str | None:
+    """Return a configured local path to an already-checked-out build-config repo, if any.
+
+    The orchestrator commonly runs from *within* a checkout of the build-config
+    repository itself (e.g. calunga-python's own CI triggers it directly), in which
+    case cloning BUILD_CONFIGS_REPO_URL again is redundant. When set, callers should
+    read the build-config repo directly from this path instead of cloning. Returns
+    None when unset, in which case callers fall back to BUILD_CONFIGS_REPO_URL/
+    BUILD_CONFIGS_REVISION.
+    """
+    local_path = os.environ.get("BUILD_CONFIGS_LOCAL_PATH", "").strip()
+    return local_path or None

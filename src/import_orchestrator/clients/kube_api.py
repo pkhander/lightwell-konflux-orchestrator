@@ -147,3 +147,13 @@ class KubeAPI:
         resp = self._session.post(self._url(api_path), json=body, timeout=self._timeout)
         resp.raise_for_status()
         return resp.json()
+
+    def delete(self, api_path: str) -> None:
+        """DELETE a single object by its resource path.
+
+        The response body (a Kubernetes ``Status``) is not parsed: callers only
+        care that the delete was accepted, and a non-JSON body would otherwise
+        raise ``JSONDecodeError``.
+        """
+        resp = self._session.delete(self._url(api_path), timeout=self._timeout)
+        resp.raise_for_status()

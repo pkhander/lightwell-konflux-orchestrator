@@ -124,9 +124,11 @@ class TestBuildManifest:
         with pytest.raises(TriggerError, match="BUILD_CONFIGS_REVISION"):
             _manifest()
 
-    def test_wheel_server_url_override(self):
+    @pytest.mark.parametrize("build_type", ["Backport", "Novel", "Validated", "Scratch"])
+    def test_wheel_server_url_override(self, build_type):
         params = {
-            p["name"]: p["value"] for p in _manifest(wheel_server_url="https://custom.repo/simple/")["spec"]["params"]
+            p["name"]: p["value"]
+            for p in _manifest(build_type=build_type, wheel_server_url="https://custom.repo/simple/")["spec"]["params"]
         }
         assert params["WHEEL_SERVER_URL"] == "https://custom.repo/simple/"
 
@@ -134,16 +136,15 @@ class TestBuildManifest:
         params = {p["name"]: p["value"] for p in _manifest(build_type="Novel")["spec"]["params"]}
         assert params["BUILD_TYPE"] == "Novel"
 
-    def test_validated_build_type_omits_wheel_server(self):
+    def test_validated_build_type_uses_default_wheel_server(self):
         params = {p["name"]: p["value"] for p in _manifest(build_type="Validated")["spec"]["params"]}
         assert params["BUILD_TYPE"] == "Validated"
-        assert params["WHEEL_SERVER_URL"] == ""
+        assert params["WHEEL_SERVER_URL"] == "https://packages.redhat.com/lightwell/python/validated/simple/"
 
-    def test_validated_build_type_ignores_wheel_server_url_arg(self):
-        # wheel_server_url is ignored when build_type is Validated
+    @pytest.mark.parametrize("build_type", ["Backport", "Novel", "Validated", "Scratch"])
+    def test_empty_wheel_server_url_disables_server(self, build_type):
         params = {
-            p["name"]: p["value"]
-            for p in _manifest(build_type="Validated", wheel_server_url="https://custom.repo/simple/")["spec"]["params"]
+            p["name"]: p["value"] for p in _manifest(build_type=build_type, wheel_server_url="")["spec"]["params"]
         }
         assert params["WHEEL_SERVER_URL"] == ""
 

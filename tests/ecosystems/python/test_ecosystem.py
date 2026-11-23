@@ -21,6 +21,7 @@ from pathlib import Path
 
 import pytest
 
+from import_orchestrator.cli import make_parser
 from import_orchestrator.ecosystems.base import Ecosystem
 from import_orchestrator.ecosystems.python import config
 from import_orchestrator.ecosystems.python.ecosystem import PythonEcosystem
@@ -131,7 +132,22 @@ def test_build_pipelinerun_validated_target_defaults_build_type(monkeypatch, tmp
     manifest = PythonEcosystem().build_pipelinerun("foolib==0.4.0", argparse.Namespace(target="VALIDATED"))
     params = {p["name"]: p["value"] for p in manifest["spec"]["params"]}
     assert params["BUILD_TYPE"] == "Validated"
-    assert params["WHEEL_SERVER_URL"] == ""
+    assert params["WHEEL_SERVER_URL"] == config.WHEEL_SERVER_URL
+
+
+@pytest.mark.parametrize("command", ["trigger", "run", "orchestrate"])
+@pytest.mark.parametrize("target", ["VALIDATED", "VALIDATED-STAGE"])
+@pytest.mark.parametrize("url", ["https://custom.repo/simple/", ""])
+def test_validated_cli_wheel_server_url(monkeypatch, tmp_path, command, target, url):
+    _pipeline_file(tmp_path, monkeypatch)
+    argv = ["python", command, "--target", target, "--wheel-server-url", url]
+    if command != "orchestrate":
+        argv.append("foolib==0.4.0")
+    args = make_parser().parse_args(argv)
+    manifest = args.ecosystem.build_pipelinerun("foolib==0.4.0", args)
+    params = {p["name"]: p["value"] for p in manifest["spec"]["params"]}
+    assert params["BUILD_TYPE"] == "Validated"
+    assert params["WHEEL_SERVER_URL"] == url
 
 
 def test_build_pipelinerun_remediated_target_defaults_build_type(monkeypatch, tmp_path):
@@ -178,6 +194,7 @@ def test_request_identity_defaults_to_remediated_target():
         "release_plan": "",
         "target": "REMEDIATED",
         "artifact": "foolib==0.4.0",
+        "source_repo": f"{config.LIGHTWELL_BUILDS_REPO_BASE}/pypi.org-foolib",
     }
 
 
@@ -205,3 +222,28 @@ def test_real_pipeline_preserves_service_account_auth_for_each_target(monkeypatc
     supplied = {param["name"] for param in spec["params"]}
     required_params = {param["name"] for param in spec["pipelineSpec"]["params"] if "default" not in param}
     assert required_params <= supplied
+
+
+@pytest.mark.parametrize("command", ["trigger", "run", "orchestrate"])
+@pytest.mark.parametrize("image", [None, "quay.io/example/builder@sha256:" + "a" * 64])
+def test_cli_builder_image_preserves_pipeline_default_unless_overridden(monkeypatch, tmp_path, command, image):
+    _pipeline_file(tmp_path, monkeypatch)
+    pipeline_path = tmp_path / "tekton/pipelines/python-build/python-build.yaml"
+    default_image = "quay.io/example/default-builder@sha256:" + "b" * 64
+    pipeline_path.write_text(
+        f"spec:\n  tasks: []\n  params:\n    - name: PYTHON_BUILDER_IMAGE\n      default: {default_image}\n"
+    )
+    argv = ["python", command, "--target", "VALIDATED-STAGE"]
+    if command != "orchestrate":
+        argv.append("foolib==0.4.0")
+    if image is not None:
+        argv.extend(["--python-builder-image", image])
+    args = make_parser().parse_args(argv)
+    manifest = args.ecosystem.build_pipelinerun("foolib==0.4.0", args)
+    params = {p["name"]: p["value"] for p in manifest["spec"]["params"]}
+    defaults = {p["name"]: p["default"] for p in manifest["spec"]["pipelineSpec"]["params"]}
+    assert defaults["PYTHON_BUILDER_IMAGE"] == default_image
+    if image is None:
+        assert "PYTHON_BUILDER_IMAGE" not in params
+    else:
+        assert params["PYTHON_BUILDER_IMAGE"] == image

@@ -32,6 +32,8 @@ from import_orchestrator.engine import (
     ImportOrchestrator,
     ImportTrigger,
     PipelineMonitor,
+    PruneMonitor,
+    Reconciler,
     ReleaseMonitor,
     RequestView,
 )
@@ -97,6 +99,10 @@ def run_orchestrate(args: argparse.Namespace, empty_db_warning: str) -> int:
     Generic across ecosystems: the ecosystem supplies its own namespace,
     PipelineRun prefix and manifest builder. ``empty_db_warning`` is the
     ecosystem-specific hint shown when the database has no references yet.
+
+    Create or reuse a request for each stored artifact using this invocation's
+    identity, and scope all work to those requests. Existing identities and
+    their attempt history remain untouched.
     """
     with WorkflowDatabase(args.db) as db:
         warn_if_legacy_database(db)
@@ -107,7 +113,13 @@ def run_orchestrate(args: argparse.Namespace, empty_db_warning: str) -> int:
         eco = args.ecosystem
         target = getattr(args, "target", None)
         skip_release = target is not None and getattr(eco, "target_skip_release", lambda t: False)(target)
-        view = RequestView(db, skip_release)
+        request_ids = set()
+        artifacts = dict.fromkeys(request.artifact for request in db.list_requests())
+        for artifact in artifacts:
+            request, _ = db.get_or_create_request(**eco.request_identity(artifact, args))
+            assert request.id is not None
+            request_ids.add(request.id)
+        view = RequestView(db, skip_release, request_ids=request_ids)
 
         if getattr(args, "print_resources", False):
             return _run_print_resources(args, view)
@@ -129,6 +141,9 @@ def run_orchestrate(args: argparse.Namespace, empty_db_warning: str) -> int:
             prefix=eco.pipelinerun_prefix,
             release_plan=getattr(args, "release_plan", None),
         )
+        reconciler = Reconciler(view=view, kube=kube, release_plan=getattr(args, "release_plan", None))
+
+        prune_monitor = PruneMonitor(view=view, kube=kube, max_retries=args.max_retries)
 
         orchestrator = ImportOrchestrator(
             view=view,
@@ -137,6 +152,8 @@ def run_orchestrate(args: argparse.Namespace, empty_db_warning: str) -> int:
             release_monitor=release_monitor,
             poll_interval=args.poll_interval,
             max_retries=args.max_retries,
+            prune_monitor=prune_monitor,
+            reconciler=reconciler,
         )
 
         return orchestrator.run_until_complete()

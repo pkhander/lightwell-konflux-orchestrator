@@ -104,3 +104,15 @@ def pipeline_definition_path() -> Path:
         return Path(pipeline_dir) / pipeline_subpath
     project_root = Path(__file__).resolve().parents[4]
     return project_root / "tekton" / pipeline_subpath
+
+
+def git_pipeline_definition_path() -> Path:
+    """Return the path to the python-git-ingest pipeline definition.
+
+    Configurable via TEKTON_PIPELINE_DIR; otherwise falls back to the repo layout.
+    """
+    pipeline_subpath = Path("pipelines") / "python-git-ingest" / "python-git-ingest.yaml"
+    if pipeline_dir := os.environ.get("TEKTON_PIPELINE_DIR"):
+        return Path(pipeline_dir) / pipeline_subpath
+    project_root = Path(__file__).resolve().parents[4]
+    return project_root / "tekton" / pipeline_subpath

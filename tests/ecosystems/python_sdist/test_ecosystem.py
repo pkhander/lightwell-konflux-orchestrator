@@ -41,6 +41,10 @@ def test_build_pipelinerun_from_ref(monkeypatch, tmp_path):
     pipeline_file.parent.mkdir(parents=True)
     pipeline_file.write_text("spec:\n  tasks: []\n")
     monkeypatch.setenv("TEKTON_PIPELINE_DIR", str(tmp_path / "tekton"))
+    monkeypatch.setattr(
+        "import_orchestrator.ecosystems.python_sdist.ecosystem.resolve_canonical_source",
+        lambda package, version: {"type": "pypi-sdist"},
+    )
 
     manifest = PythonSdistEcosystem().build_pipelinerun("foolib==0.4.0", argparse.Namespace())
 
@@ -66,6 +70,10 @@ def test_build_pipelinerun_scratch_target_uses_scratch_app(monkeypatch, tmp_path
     pipeline_file.parent.mkdir(parents=True)
     pipeline_file.write_text("spec:\n  tasks: []\n")
     monkeypatch.setenv("TEKTON_PIPELINE_DIR", str(tmp_path / "tekton"))
+    monkeypatch.setattr(
+        "import_orchestrator.ecosystems.python_sdist.ecosystem.resolve_canonical_source",
+        lambda package, version: {"type": "pypi-sdist"},
+    )
 
     args = argparse.Namespace(target="SCRATCH")
     manifest = PythonSdistEcosystem().build_pipelinerun("foolib==0.4.0", args)
@@ -80,11 +88,37 @@ def test_build_pipelinerun_default_target_uses_mirror_app(monkeypatch, tmp_path)
     pipeline_file.parent.mkdir(parents=True)
     pipeline_file.write_text("spec:\n  tasks: []\n")
     monkeypatch.setenv("TEKTON_PIPELINE_DIR", str(tmp_path / "tekton"))
+    monkeypatch.setattr(
+        "import_orchestrator.ecosystems.python_sdist.ecosystem.resolve_canonical_source",
+        lambda package, version: {"type": "pypi-sdist"},
+    )
 
     manifest = PythonSdistEcosystem().build_pipelinerun("foolib==0.4.0", argparse.Namespace())
 
     labels = manifest["metadata"]["labels"]
     assert labels["appstudio.openshift.io/application"] == "python-sdist-mirror"
+
+
+def test_build_pipelinerun_routes_git_source_to_git_ingest_pipeline(monkeypatch, tmp_path):
+    git_pipeline_file = tmp_path / "tekton" / "pipelines" / "python-git-ingest" / "python-git-ingest.yaml"
+    git_pipeline_file.parent.mkdir(parents=True)
+    git_pipeline_file.write_text("spec:\n  tasks: []\n")
+    monkeypatch.setenv("TEKTON_PIPELINE_DIR", str(tmp_path / "tekton"))
+    monkeypatch.setattr(
+        "import_orchestrator.ecosystems.python_sdist.ecosystem.resolve_canonical_source",
+        lambda package, version: {
+            "type": "git",
+            "upstream_url": "https://github.com/mkdocstrings/griffe",
+            "ref": "2.3.2",
+        },
+    )
+
+    manifest = PythonSdistEcosystem().build_pipelinerun("griffe==2.3.2", argparse.Namespace())
+
+    params = {p["name"]: p["value"] for p in manifest["spec"]["params"]}
+    assert params["UPSTREAM_URL"] == "https://github.com/mkdocstrings/griffe"
+    assert params["UPSTREAM_REF"] == "2.3.2"
+    assert manifest["metadata"]["generateName"] == "python-sdist-ingest-"  # prefix unchanged — see Step 3 note
 
 
 def test_request_identity_defaults_to_mirror_target():
